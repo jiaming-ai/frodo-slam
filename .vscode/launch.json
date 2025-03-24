@@ -1,0 +1,25 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+
+        {
+            "name": "Run Main",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "main.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "python": "/home/jiaming/Projects/frodobot/ms/.venv/bin/python",
+            "args": [
+                "--dataset",
+                "data/filtered_8k_1/ride_53663_1f6131_20240604235653/img/",
+            ],
+            "env": { 
+                "CUDA_LAUNCH_BLOCKING": "1"
+            }
+        }
+    ]
+}
