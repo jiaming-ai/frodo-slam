@@ -9,32 +9,140 @@ from mast3r_slam.geometry import (
 )
 from mast3r_slam.nonlinear_optimizer import check_convergence, huber
 from mast3r_slam.config import config
-from mast3r_slam.mast3r_utils import mast3r_match_asymmetric
+from mast3r_slam.mast3r_utils import (
+    mast3r_match_asymmetric, 
+    mast3r_inference_mono, 
+    mast3r_match_symmetric
+)
 from mast3r.fast_nn import fast_reciprocal_NNs
 from mast3r_slam.visualization_utils import visualize_matches
 import matplotlib.pyplot as plt
 from mast3r_slam.matching import pixel_to_lin, lin_to_pixel
+from mast3r_slam.frame import Mode
+
+class FrameBuffer:
+    def __init__(self, window_size=8, offset_to_current=[-2,-4]):
+        assert -min(offset_to_current) < window_size,\
+            "Window size must be less than the minimum edge"
+
+        self.encoder_buffer = [None] * window_size
+        self.buffer_size = window_size
+        self.offset_to_current = offset_to_current
+        self._idx = -1
+        self.pairs = []
+
+    def add_encoder_result(self, frame):
+        """Add a frame to the buffer
+        Args:
+            frame (Frame): (feat, pos)
+            n (int): frame id. 
+        """
+        self._idx += 1
+        self.encoder_buffer[self._idx % self.buffer_size] = (frame.feat, frame.pos)
+
+    def prepare_decoder_inputs(self):
+        """Get the encoder feature for a given frame id
+        Assumes the buffer is full
+        """
+        if self._idx < self.buffer_size:
+            return None, None, None, None
+        idxs_i = [(self._idx + offset) % self.buffer_size for offset in self.offset_to_current]
+        idxs_j = [self._idx % self.buffer_size] * len(self.offset_to_current)
+        frames_i = [self.encoder_buffer[idx] for idx in idxs_i]
+        frames_j = [self.encoder_buffer[idx] for idx in idxs_j]
+
+        feats_i = torch.cat([frame[0] for frame in frames_i], dim=0)
+        feats_j = torch.cat([frame[0] for frame in frames_j], dim=0)
+        pos_i = torch.cat([frame[1] for frame in frames_i], dim=0)
+        pos_j = torch.cat([frame[1] for frame in frames_j], dim=0)
+        return feats_i, pos_i, feats_j, pos_j
+    
+    def add_decoder_results(self, frames):
+        """Add a frame to the buffer
+        Args:
+            frames (list): list of frames
+        """
+        pass
+    def reset(self):
+        self.encoder_buffer = [None] * self.buffer_size
+        self._idx = -1
+
 class FrameTracker:
-    def __init__(self, model, frames, device):
+    def __init__(self, model, frames, device, states):
         self.cfg = config["tracking"]
         self.model = model
         self.keyframes = frames
+        self.states = states
+        # cache the last keyframe
+        self.last_kf = None
         self.device = device
 
         self.reset_idx_f2k()
+
+
+        self._offset_to_current = [-2,-4]
+        self._local_window_size = 6
+
+        # n key frame
+        self._n = 0
+        self._mode = "init"
+        # the relative id from the current keyframe
+        self._buffer = FrameBuffer(window_size=self._local_window_size, 
+                                   offset_to_current=self._offset_to_current)
+    
+    def reset(self, keyframes):
+        """Reset the tracker
+        Reset should be called after a new map is created
+        """
+        # assumes the keyframes contains the first keyframe
+        self.keyframes = keyframes
+        self.reset_idx_f2k()
+        self._n = 0
+        self._mode = "init"
+        self._buffer.reset()
+        self.last_kf = None
 
     # Initialize with identity indexing of size (1,n)
     def reset_idx_f2k(self):
         self.idx_f2k = None
 
-    def track(self, frame: Frame):
-        keyframe = self.keyframes.last_keyframe()
+    def init_tracking(self, frame: Frame):
+        """Initialize the tracker
+        Args:
+            frame (Frame): frame to initialize
+        """
+        if frame.feat is None:
+            # Initialize via mono inference, and encoded features neeed for database
+            X_init, C_init = mast3r_inference_mono(self.model, frame)
+            frame.update_pointmap(X_init, C_init)
 
+            # only add encoder result if it's not been added yet
+            self._buffer.add_encoder_result(frame)
+
+        self.keyframes.append(frame)
+        self.states.set_mode(Mode.TRACKING)
+        self.states.set_frame(frame)
+        self.last_kf = frame
+        self.img_shape = frame.img_true_shape
+
+
+    def track(self, frame: Frame) -> tuple[list, bool]:
+        """Track the frame
+        Args:
+            frame (Frame): frame to track
+        Returns:
+            list: list of results
+            bool: True if tracking failed
+        """
         # only Dff, Dkf is HxWxC
         idx_f2k, valid_match_k, Xff, Cff, Qff, Xkf, Ckf, Qkf, Dff, Dkf \
             = mast3r_match_asymmetric(
-            self.model, frame, keyframe, idx_i2j_init=self.idx_f2k
+            self.model, frame, self.last_kf, idx_i2j_init=self.idx_f2k
         )
+        frame.update_pointmap(Xff, Cff)
+
+
+        
         # Save idx for next
         self.idx_f2k = idx_f2k.clone()
 
@@ -63,17 +171,16 @@ class FrameTracker:
                 # visualize matches
                 matchesff = lin_to_pixel(idx_f2k[valid_opt[:, 0]], frame.img.shape[-1])
                 matcheskf = lin_to_pixel(torch.arange(valid_opt.shape[0],\
-                    device=self.device)[valid_opt[:, 0]], keyframe.img.shape[-1])
+                    device=self.device)[valid_opt[:, 0]], self.last_kf.img.shape[-1])
                 visualize_matches(
                     matchesff.cpu().numpy(),
                     matcheskf.cpu().numpy(),
                     frame.img[0].cpu(),
-                    keyframe.img.cpu(),
+                    self.last_kf.img.cpu(),
                 )
 
             # optionally, use fnn matching
-            use_fnn = True
-            if use_fnn:
+            if self.cfg["use_fnn"]:
                 print(f"Running fnn matching for frame {frame.frame_id}")
                 matchesff, matcheskf = fast_reciprocal_NNs(
                     Dff,
@@ -82,11 +189,17 @@ class FrameTracker:
                     dist='dot'
                 )
                 # need to make sure the index
-                idx_kf = pixel_to_lin(torch.tensor(matcheskf.copy(), device=self.device), keyframe.img.shape[-1])
+                idx_kf = pixel_to_lin(
+                    torch.tensor(matcheskf.copy(), device=self.device), 
+                    self.last_kf.img.shape[-1])
                 valid_match_k = torch.zeros_like(valid_match_k, dtype=torch.bool)
                 valid_match_k[idx_kf] = True
                 
-                idx_f2k_valid = pixel_to_lin(torch.tensor(matchesff.copy(), device=self.device), frame.img.shape[-1])
+                idx_f2k_valid = pixel_to_lin(
+                    torch.tensor(
+                        matchesff.copy(), 
+                        device=self.device),
+                    frame.img.shape[-1])
 
                 idx_f2k = torch.zeros_like(idx_f2k)
                 idx_f2k[idx_kf] = idx_f2k_valid
@@ -110,32 +223,30 @@ class FrameTracker:
                         matchesff,
                         matcheskf,
                         frame.img[0].cpu(),
-                        keyframe.img.cpu(),
+                        self.last_kf.img.cpu(),
                     )
                 if match_frac < self.cfg["min_match_frac_fnn"]:
                     print(f"Skipped frame {frame.frame_id} after fnn matching")
-                    return False, [], True
+                    return [], True
                 
                 # reset idx_f2k
                 self.reset_idx_f2k()
 
             else:
                 print(f"Skipped frame {frame.frame_id} without fnn matching")
-                return False, [], True
+                return [], True
 
 
-        frame.update_pointmap(Xff, Cff)
 
         use_calib = config["use_calib"]
-        img_size = frame.img.shape[-2:]
         if use_calib:
-            K = keyframe.K
+            K = self.last_kf.K
         else:
             K = None
 
         # Get poses and point correspondneces and confidences
         Xf, Xk, T_WCf, T_WCk, Cf, Ck, meas_k, valid_meas_k = self.get_points_poses(
-            frame, keyframe, idx_f2k, img_size, use_calib, K
+            frame, self.last_kf, idx_f2k, self.img_shape, use_calib, K
         )
 
         try:
@@ -159,32 +270,61 @@ class FrameTracker:
                     meas_k,
                     valid_meas_k,
                     K,
-                    img_size,
+                    self.img_shape,
                 )
         except Exception as e:
             print(f"Cholesky failed {frame.frame_id}")
-            return False, [], True
+            return [], True
 
         frame.T_WC = T_WCf
 
         # Use pose to transform points to update keyframe
         Xkk = T_CkCf.act(Xkf)
-        keyframe.update_pointmap(Xkk, Ckf)
+        self.last_kf.update_pointmap(Xkk, Ckf)
         # write back the fitered pointmap
-        self.keyframes[len(self.keyframes) - 1] = keyframe
 
         unique_valid_match = torch.unique(idx_f2k[valid_kf[:, 0]]).shape[0] / valid_kf.numel()
         new_kf = unique_valid_match < self.cfg["match_frac_thresh"]
 
         # Rest idx if new keyframe
         if new_kf:
+            # update the keyframe in shared memory when new keyframe is created
+            self.keyframes[len(self.keyframes) - 1] = self.last_kf
             self.reset_idx_f2k()
 
+            # set the current frame as the last keyframe
+            self.last_kf = frame
+            self.keyframes.append(frame)
+
+            # perform local optimization if a new keyframe is created
+            self._buffer.add_encoder_result(frame)
+            # prepare decoder inputs
+            feats_i, pos_i, feats_j, pos_j = self._buffer.prepare_decoder_inputs()
+            if feats_i is not None:
+                n_frames = len(self._offset_to_current)
+                (
+                    idx_i2j,
+                    idx_j2i,
+                    valid_match_j,
+                    valid_match_i,
+                    Qii,
+                    Qjj,
+                    Qji,
+                    Qij,
+                ) = mast3r_match_symmetric(
+                    self.model, 
+                    feats_i, 
+                    pos_i, 
+                    feats_j, 
+                    pos_j, 
+                    self.img_shape, 
+                    self.img_shape
+                )
+
         return (
-            new_kf,
             [
-                keyframe.X_canon,
-                keyframe.get_average_conf(),
+                self.last_kf.X_canon,
+                self.last_kf.get_average_conf(),
                 frame.X_canon,
                 frame.get_average_conf(),
                 Qkf,

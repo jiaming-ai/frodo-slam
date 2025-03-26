@@ -33,8 +33,18 @@ def load_retriever(mast3r_model, retriever_path=None, device="cuda"):
 
 @torch.inference_mode
 def decoder(model, feat1, feat2, pos1, pos2, shape1, shape2):
-    dec1, dec2 = model._decoder(feat1, pos1, feat2, pos2)
+
+    # # pretend to be a batch
+    # repeat_times = 4
+    # feat1 = feat1.repeat(repeat_times, 1, 1)
+    # feat2 = feat2.repeat(repeat_times, 1, 1)
+    # pos1 = pos1.repeat(repeat_times, 1, 1)
+    # pos2 = pos2.repeat(repeat_times, 1, 1)
+    # shape1 = shape1.repeat(repeat_times, 1)
+    # shape2 = shape2.repeat(repeat_times, 1)
+
     with torch.amp.autocast(enabled=False, device_type="cuda"):
+        dec1, dec2 = model._decoder(feat1, pos1, feat2, pos2)
         res1 = model._downstream_head(1, [tok.float() for tok in dec1], shape1)
         res2 = model._downstream_head(2, [tok.float() for tok in dec2], shape2)
     return res1, res2
@@ -85,33 +95,74 @@ def mast3r_symmetric_inference(model, frame_i, frame_j):
 def mast3r_decode_symmetric_batch(
     model, feat_i, pos_i, feat_j, pos_j, shape_i, shape_j
 ):
-    B = feat_i.shape[0]
-    X, C, D, Q = [], [], [], []
-    for b in range(B):
-        feat1 = feat_i[b][None]
-        feat2 = feat_j[b][None]
-        pos1 = pos_i[b][None]
-        pos2 = pos_j[b][None]
-        res11, res21 = decoder(model, feat1, feat2, pos1, pos2, shape_i[b], shape_j[b])
-        res22, res12 = decoder(model, feat2, feat1, pos2, pos1, shape_j[b], shape_i[b])
-        res = [res11, res21, res22, res12]
-        Xb, Cb, Db, Qb = zip(
-            *[
-                (r["pts3d"][0], r["conf"][0], r["desc"][0], r["desc_conf"][0])
-                for r in res
-            ]
-        )
-        X.append(torch.stack(Xb, dim=0))
-        C.append(torch.stack(Cb, dim=0))
-        D.append(torch.stack(Db, dim=0))
-        Q.append(torch.stack(Qb, dim=0))
+    # let's do this in batch
+    feat1 = torch.cat([feat_i, feat_j], dim=0)
+    pos1 = torch.cat([pos_i, pos_j], dim=0)
+    shape1 = shape_i 
+    
+    feat2 = torch.cat([feat_j, feat_i], dim=0)
+    pos2 = torch.cat([pos_j, pos_i], dim=0)
+    shape2 = shape_j
 
-    X, C, D, Q = (
-        torch.stack(X, dim=1),
-        torch.stack(C, dim=1),
-        torch.stack(D, dim=1),
-        torch.stack(Q, dim=1),
-    )
+    # 11, 12, 
+    res11, res21 = decoder(model, feat1, feat2, pos1, pos2, shape1, shape2)
+    N = feat_i.shape[0]
+    X = torch.stack((
+        res11["pts3d"][:N], 
+        res21["pts3d"][:N], 
+        res11["pts3d"][N:], 
+        res21["pts3d"][N:]
+    ), dim=0)
+    C = torch.stack((
+        res11["conf"][:N], 
+        res21["conf"][:N], 
+        res11["conf"][N:], 
+        res21["conf"][N:]
+    ), dim=0)
+    D = torch.stack((
+        res11["desc"][:N], 
+        res21["desc"][:N], 
+        res11["desc"][N:], 
+        res21["desc"][N:]
+    ), dim=0)
+    Q = torch.stack((
+        res11["desc_conf"][:N], 
+        res21["desc_conf"][:N], 
+        res11["desc_conf"][N:], 
+        res21["desc_conf"][N:]
+    ), dim=0)
+    
+    X, C, D, Q = downsample(X, C, D, Q)
+    return X, C, D, Q
+    
+    
+    # B = feat_i.shape[0]
+    # X, C, D, Q = [], [], [], []
+    # for b in range(B):
+    #     feat1 = feat_i[b][None]
+    #     feat2 = feat_j[b][None]
+    #     pos1 = pos_i[b][None]
+    #     pos2 = pos_j[b][None]
+    #     res11, res21 = decoder(model, feat1, feat2, pos1, pos2, shape_i[b], shape_j[b])
+    #     res22, res12 = decoder(model, feat2, feat1, pos2, pos1, shape_j[b], shape_i[b])
+    #     res = [res11, res21, res22, res12]
+    #     Xb, Cb, Db, Qb = zip(
+    #         *[
+    #             (r["pts3d"][0], r["conf"][0], r["desc"][0], r["desc_conf"][0])
+    #             for r in res
+    #         ]
+    #     )
+    #     X.append(torch.stack(Xb, dim=0))
+    #     C.append(torch.stack(Cb, dim=0))
+    #     D.append(torch.stack(Db, dim=0))
+    #     Q.append(torch.stack(Qb, dim=0))
+
+    # X, C, D, Q = (
+    #     torch.stack(X, dim=1),
+    #     torch.stack(C, dim=1),
+    #     torch.stack(D, dim=1),
+    #     torch.stack(Q, dim=1),
+    # )
     X, C, D, Q = downsample(X, C, D, Q)
     return X, C, D, Q
 
@@ -209,7 +260,74 @@ def mast3r_asymmetric_inference(model, frame_i, frame_j):
     X, C, D, Q = downsample(X, C, D, Q)
     return X, C, D, Q
 
+# @torch.inference_mode
+# def mast3r_match_batch_cache(model, frame_i, frame_j, idx_i2j_init=None):
+#     X, C, D, Q = mast3r_decode_symmetric_batch(
+#         model, feat_i, pos_i, feat_j, pos_j, shape_i, shape_j
+#     )
 
+#     # Ordering 4xbxhxwxc
+#     b = X.shape[1]
+
+#     Xii, Xji, Xjj, Xij = X[0], X[1], X[2], X[3]
+#     Dii, Dji, Djj, Dij = D[0], D[1], D[2], D[3]
+#     Qii, Qji, Qjj, Qij = Q[0], Q[1], Q[2], Q[3]
+
+#     # Always matching both
+#     X11 = torch.cat((Xii, Xjj), dim=0)
+#     X21 = torch.cat((Xji, Xij), dim=0)
+#     D11 = torch.cat((Dii, Djj), dim=0)
+#     D21 = torch.cat((Dji, Dij), dim=0)
+
+#     # tic()
+#     idx_1_to_2, valid_match_2 = matching.match(X11, X21, D11, D21)
+#     # toc("Match")
+
+#     # TODO: Avoid this
+#     match_b = X11.shape[0] // 2
+#     idx_i2j = idx_1_to_2[:match_b]
+#     idx_j2i = idx_1_to_2[match_b:]
+#     valid_match_j = valid_match_2[:match_b]
+#     valid_match_i = valid_match_2[match_b:]
+
+#     return (
+#         idx_i2j,
+#         idx_j2i,
+#         valid_match_j,
+#         valid_match_i,
+#         Qii.view(b, -1, 1),
+#         Qjj.view(b, -1, 1),
+#         Qji.view(b, -1, 1),
+#         Qij.view(b, -1, 1),
+#     )
+    
+    
+
+#     X, C, D, Q = mast3r_asymmetric_inference(model, frame_i, frame_j)
+
+#     b, h, w = X.shape[:-1]
+#     # 2 outputs per inference
+#     b = b // 2
+
+#     Dii, Dji = D[:b], D[b:]
+#     Xii, Xji = X[:b], X[b:]
+#     Cii, Cji = C[:b], C[b:]
+#     Qii, Qji = Q[:b], Q[b:]
+
+#     idx_i2j, valid_match_j = matching.match(
+#         Xii, Xji, Dii, Dji, idx_1_to_2_init=idx_i2j_init
+#     )
+
+#     # How rest of system expects it
+#     Xii, Xji = einops.rearrange(X, "b h w c -> b (h w) c")
+#     Cii, Cji = einops.rearrange(C, "b h w -> b (h w) 1")
+#     Qii, Qji = einops.rearrange(Q, "b h w -> b (h w) 1")
+#     # Dii, Dji = einops.rearrange(D, "b h w c -> b (h w) c")
+#     Dii, Dji = Dii[0], Dji[0]
+
+#     return idx_i2j, valid_match_j, Xii, Cii, Qii, Xji, Cji, Qji, Dii, Dji
+
+@torch.inference_mode
 def mast3r_match_asymmetric(model, frame_i, frame_j, idx_i2j_init=None):
     X, C, D, Q = mast3r_asymmetric_inference(model, frame_i, frame_j)
 

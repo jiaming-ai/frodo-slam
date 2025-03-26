@@ -71,12 +71,14 @@ def relocalization(frame, keyframes, factor_graph, retrieval_database):
         return successful_loop_closure
 
 
+
+
 def run_local_mapping(cfg, model, states, keyframes, K):
     set_global_config(cfg)
 
     device = keyframes.device
     factor_graph = FactorGraph(model, keyframes, K, device)
-    retrieval_database = load_retriever(model, device=device)
+    # retrieval_database = load_retriever(model, device=device)
 
     mode = states.get_mode()
     while mode is not Mode.TERMINATED:
@@ -106,18 +108,18 @@ def run_local_mapping(cfg, model, states, keyframes, K):
         for j in range(min(n_consec, idx)):
             kf_idx.append(idx - 1 - j)
         frame = keyframes[idx]
-        retrieval_inds = retrieval_database.update(
-            frame,
-            add_after_query=True,
-            k=config["retrieval"]["k"],
-            min_thresh=config["retrieval"]["min_thresh"],
-        )
-        kf_idx += retrieval_inds
+        # retrieval_inds = retrieval_database.update(
+        #     frame,
+        #     add_after_query=True,
+        #     k=config["retrieval"]["k"],
+        #     min_thresh=config["retrieval"]["min_thresh"],
+        # )
+        # kf_idx += retrieval_inds
 
-        lc_inds = set(retrieval_inds)
-        lc_inds.discard(idx - 1)
-        if len(lc_inds) > 0:
-            print("Database retrieval", idx, ": ", lc_inds)
+        # lc_inds = set(retrieval_inds)
+        # lc_inds.discard(idx - 1)
+        # if len(lc_inds) > 0:
+        #     print("Database retrieval", idx, ": ", lc_inds)
 
         kf_idx = set(kf_idx)  # Remove duplicates by using set
         kf_idx.discard(idx)  # Remove current kf idx if included
@@ -151,7 +153,6 @@ def main(args):
     device = "cuda:0"
     save_frames = False
     datetime_now = str(datetime.datetime.now()).replace(" ", "_")
-
 
     load_config(args.config)
     print(args.dataset)
@@ -215,7 +216,7 @@ def main(args):
         if recon_file.exists():
             recon_file.unlink()
 
-    tracker = FrameTracker(model, keyframes, device)
+    tracker = FrameTracker(model, keyframes, device, states)
     last_msg = WindowMsg()
 
     def new_altas():
@@ -230,14 +231,13 @@ def main(args):
         print("Sending new keyframes to visualization")
         main2viz.put({"new_keyframes": keyframes})
         print("Sent new keyframes to visualization")
-        tracker.keyframes = keyframes
         return keyframes
 
 
-    # backend = mp.Process(target=run_backend, args=(config, model, states, keyframes, K))
-    # backend.start()
+    backend = mp.Process(target=run_local_mapping, args=(config, model, states, keyframes, K))
+    backend.start()
 
-    i = 380
+    i = 350
     fps_timer = time.time()
     fps_counter = 0
 
@@ -283,17 +283,12 @@ def main(args):
         frame = create_frame(i, img, T_WC, img_size=dataset.img_size, device=device)
 
         if mode == Mode.INIT:
-            # Initialize via mono inference, and encoded features neeed for database
-            X_init, C_init = mast3r_inference_mono(model, frame)
-            frame.update_pointmap(X_init, C_init)
-            keyframes.append(frame)
-            states.set_mode(Mode.TRACKING)
-            states.set_frame(frame)
+            tracker.init_tracking(frame)
             i += 1
             continue
 
         if mode == Mode.TRACKING:
-            add_new_kf, match_info, track_failed = tracker.track(frame)
+            match_info, track_failed = tracker.track(frame)
 
             # if tracking failed, init a new map
             if track_failed:
@@ -301,11 +296,8 @@ def main(args):
                 if loss_track_counter >= config["tracking"]["new_map_after_loss_track_N"]:
                     print(f"Creating new map after tracking loss for {loss_track_counter} frames...")
                     new_altas()
-                    # TODO: we can use X, C from tracker.track()
-                    frame = create_frame(i, img, T_WC, img_size=dataset.img_size, device=device)
-                    X_init, C_init = mast3r_inference_mono(model, frame)
-                    frame.update_pointmap(X_init, C_init)
-                    keyframes.append(frame)
+                    tracker.reset(keyframes)
+                    tracker.init_tracking(frame)
                     loss_track_counter = 0
             else:
                 # only update the frame if tracking is successful
@@ -313,33 +305,21 @@ def main(args):
                 loss_track_counter = 0
 
 
-        elif mode == Mode.RELOC:
-            X, C = mast3r_inference_mono(model, frame)
-            frame.update_pointmap(X, C)
-            states.set_frame(frame)
-            states.queue_reloc()
-            # In single threaded mode, make sure relocalization happen for every frame
-            while config["single_thread"]:
-                with states.lock:
-                    if states.reloc_sem.value == 0:
-                        break
-                time.sleep(0.01)
+        # elif mode == Mode.RELOC:
+        #     X, C = mast3r_inference_mono(model, frame)
+        #     frame.update_pointmap(X, C)
+        #     states.set_frame(frame)
+        #     states.queue_reloc()
+        #     # In single threaded mode, make sure relocalization happen for every frame
+        #     while config["single_thread"]:
+        #         with states.lock:
+        #             if states.reloc_sem.value == 0:
+        #                 break
+        #         time.sleep(0.01)
 
         else:
             raise Exception("Invalid mode")
 
-        if add_new_kf:
-
-            # try to do local optimization
-            keyframes.append(frame)
-
-            # states.queue_global_optimization(len(keyframes) - 1)
-            # In single threaded mode, wait for the backend to finish
-            while config["single_thread"]:
-                with states.lock:
-                    if len(states.global_optimizer_tasks) == 0:
-                        break
-                time.sleep(0.01)
         # log time
         if i % 30 == 0:
             FPS = fps_counter / (time.time() - fps_timer)
@@ -376,7 +356,7 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", default="datasets/tum/rgbd_dataset_freiburg1_desk")
-    parser.add_argument("--config", default="config/base.yaml")
+    parser.add_argument("--config", default="config/base_no_fnn.yaml")
     parser.add_argument("--save-as", default="default")
     parser.add_argument("--no-viz", action="store_true")
     parser.add_argument("--calib", default="")
