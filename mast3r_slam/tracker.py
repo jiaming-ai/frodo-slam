@@ -20,7 +20,7 @@ from mast3r_slam.visualization_utils import visualize_matches
 import matplotlib.pyplot as plt
 from mast3r_slam.matching import pixel_to_lin, lin_to_pixel
 from mast3r_slam.frame import Mode, KeyframesCuda
-
+from mast3r_slam.pgo import PoseGraph
 class LocalMapOptimizer:
     def __init__(self, 
                  model,
@@ -101,6 +101,7 @@ class LocalMapOptimizer:
             return
         self.graph.add_factors(idxs_i, idxs_j)
         
+
 class FrameTracker:
     def __init__(self, model, frames, device, states):
         self.cfg = config["tracking"]
@@ -112,6 +113,8 @@ class FrameTracker:
         self.device = device
 
         self.reset_idx_f2k()
+        
+        self.local_opt = PoseGraph(device=self.device)
 
 
         # self._offset_to_current = [-1, -3, -5]
@@ -136,6 +139,7 @@ class FrameTracker:
         self.reset_idx_f2k()
         self.last_kf = None
 
+        self.local_opt.reset()
         # self._mode = Mode.INIT
         # self.local_opt.reset()
 
@@ -155,6 +159,8 @@ class FrameTracker:
 
             # only add encoder result if it's not been added yet
             # self.local_opt.add_frame(frame, 0)
+            self.local_opt.add_frame(frame)
+            self.local_opt.last_frame_is_keyframe(0)
 
         self.keyframes.append(frame)
         self.states.set_mode(Mode.TRACKING)
@@ -179,8 +185,6 @@ class FrameTracker:
         )
         frame.update_pointmap(Xff, Cff)
 
-
-        
         # Save idx for next
         self.idx_f2k = idx_f2k.clone()
 
@@ -316,6 +320,10 @@ class FrameTracker:
 
         frame.T_WC = T_WCf
 
+        # add frame to the local optimizer
+        # must be called after the pose is updated
+        self.local_opt.add_frame(frame)
+
         # Use pose to transform points to update keyframe
         Xkk = T_CkCf.act(Xkf)
         self.last_kf.update_pointmap(Xkk, Ckf)
@@ -333,6 +341,21 @@ class FrameTracker:
             # set the current frame as the last keyframe
             self.last_kf = frame
             idx = self.keyframes.append(frame)
+
+            # self.local_opt.last_frame_is_keyframe(idx)
+
+            # print(f"before optimize: {frame.T_WC.data[0]}")
+            # success = self.local_opt.optimize()
+            # if success:
+            #     kf_poses, kf_idx = self.local_opt.get_kf_poses()
+            #     self.keyframes.update_T_WCs(kf_poses, kf_idx)
+
+            #     # update the last keyframe pose
+            #     self.last_kf.T_WC.data = kf_poses[kf_idx == idx][0].to(self.device)
+            #     print(f"after optimize: {frame.T_WC.data[0]}")
+
+
+
 
             # perform local optimization if a new keyframe is created
             # self.local_opt.add_frame(frame, idx)

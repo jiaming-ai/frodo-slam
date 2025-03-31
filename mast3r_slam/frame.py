@@ -29,6 +29,7 @@ class Frame:
     N: int = 0
     N_updates: int = 0
     K: Optional[torch.Tensor] = None
+    odom: Optional[torch.Tensor] = None
 
     def get_score(self, C):
         filtering_score = config["tracking"]["filtering_score"]
@@ -108,7 +109,7 @@ class Frame:
         return self.C / self.N if self.C is not None else None
 
 
-def create_frame(i, img, T_WC, img_size=512, device="cuda:0"):
+def create_frame(i, img, T_WC, img_size=512, device="cuda:0", odom=None):
     img = resize_img(img, img_size)
     rgb = img["img"].to(device=device)
     img_shape = torch.tensor(img["true_shape"], device=device)
@@ -118,7 +119,7 @@ def create_frame(i, img, T_WC, img_size=512, device="cuda:0"):
     if downsample > 1:
         uimg = uimg[::downsample, ::downsample]
         img_shape = img_shape // downsample
-    frame = Frame(i, rgb, img_shape, img_true_shape, uimg, T_WC)
+    frame = Frame(i, rgb, img_shape, img_true_shape, uimg, T_WC, odom=odom)
     return frame
 
 

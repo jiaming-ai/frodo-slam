@@ -22,6 +22,7 @@ from mast3r_slam.mast3r_utils import (
     mast3r_inference_mono,
 )
 from mast3r_slam.multiprocess_utils import new_queue, try_get_msg
+from mast3r_slam.pgo import pos_yaw_to_se3
 from mast3r_slam.tracker import FrameTracker
 from mast3r_slam.visualization import WindowMsg, run_visualization
 import torch.multiprocessing as mp
@@ -285,7 +286,7 @@ def main(args):
             if i == 0
             else states.get_frame().T_WC
         )
-        frame = create_frame(i, img, T_WC, img_size=dataset.img_size, device=device)
+        frame = create_frame(i, img, T_WC, img_size=dataset.img_size, device=device, odom= pos_yaw_to_se3(odom['pos'][i], odom['yaw'][i]))
 
         if mode == Mode.INIT:
             tracker.init_tracking(frame)
@@ -308,19 +309,6 @@ def main(args):
                 # only update the frame if tracking is successful
                 states.set_frame(frame)
                 loss_track_counter = 0
-
-
-        # elif mode == Mode.RELOC:
-        #     X, C = mast3r_inference_mono(model, frame)
-        #     frame.update_pointmap(X, C)
-        #     states.set_frame(frame)
-        #     states.queue_reloc()
-        #     # In single threaded mode, make sure relocalization happen for every frame
-        #     while config["single_thread"]:
-        #         with states.lock:
-        #             if states.reloc_sem.value == 0:
-        #                 break
-        #         time.sleep(0.01)
 
         else:
             raise Exception("Invalid mode")
