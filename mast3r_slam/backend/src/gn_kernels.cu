@@ -412,6 +412,71 @@ retrSim3(const float *xi, const float* t, const float* q, const float* s, float*
   s1[0] = ds[0] * s[0];
 }
 
+__device__ void
+retrSim3Right(const float *xi, const float* t, const float* q, const float* s, float* t1, float* q1, float* s1) {
+
+  // Calculate the small transformation delta_T = Exp(xi)
+  float dt_local[3] = {0, 0, 0};   // delta_t_local from expSim3
+  float dq_delta[4] = {0, 0, 0, 1}; // delta_R from expSim3
+  float ds_rel[1] = {0};           // delta_s_rel = exp(delta_s_tangent) from expSim3
+
+  expSim3(xi, dt_local, dq_delta, ds_rel); // xi -> (dt_local, dq_delta, ds_rel)
+
+  // 1. Update Scale: s' = s * delta_s_rel
+  s1[0] = s[0] * ds_rel[0];
+
+  // 2. Update Rotation: R' = R * delta_R  => q' = q * dq_delta
+  quat_comp(q, dq_delta, q1); // Note the order: q * dq_delta
+
+  // 3. Update Translation: t' = s * R * delta_t_local + t
+  float temp_t[3];
+  actSO3(q, dt_local, temp_t);  // temp_t = R * dt_local
+  scale_vec3_inplace(temp_t, s[0]); // temp_t = s * R * dt_local
+  t1[0] = temp_t[0] + t[0];
+  t1[1] = temp_t[1] + t[1];
+  t1[2] = temp_t[2] + t[2];
+}
+
+__global__ void pose_retr_kernel_right(
+    torch::PackedTensorAccessor32<float,2,torch::RestrictPtrTraits> poses,
+    const torch::PackedTensorAccessor32<float,2,torch::RestrictPtrTraits> dx,
+    const int num_fix) 
+{
+  const int num_poses = poses.size(0);
+
+  for (int k=num_fix+threadIdx.x; k<num_poses; k+=blockDim.x) {
+    float xi[7], q[4], q1[4], t[3], t1[3], s[1], s1[1];
+
+    t[0] = poses[k][0];
+    t[1] = poses[k][1];
+    t[2] = poses[k][2];
+
+    q[0] = poses[k][3];
+    q[1] = poses[k][4];
+    q[2] = poses[k][5];
+    q[3] = poses[k][6];
+
+    s[0] = poses[k][7];
+    
+    for (int n=0; n<7; n++) {
+      xi[n] = dx[k-num_fix][n];
+    }
+
+    retrSim3Right(xi, t, q, s, t1, q1, s1);
+
+    poses[k][0] = t1[0];
+    poses[k][1] = t1[1];
+    poses[k][2] = t1[2];
+
+    poses[k][3] = q1[0];
+    poses[k][4] = q1[1];
+    poses[k][5] = q1[2];
+    poses[k][6] = q1[3];
+
+    poses[k][7] = s1[0];
+  }
+}
+
 __global__ void pose_retr_kernel(
     torch::PackedTensorAccessor32<float,2,torch::RestrictPtrTraits> poses,
     const torch::PackedTensorAccessor32<float,2,torch::RestrictPtrTraits> dx,
@@ -452,363 +517,19 @@ __global__ void pose_retr_kernel(
   }
 }
 
-__global__ void point_align_kernel(
-    const torch::PackedTensorAccessor32<float,2,torch::RestrictPtrTraits> Twc,
-    const torch::PackedTensorAccessor32<float,3,torch::RestrictPtrTraits> Xs,
-    const torch::PackedTensorAccessor32<float,3,torch::RestrictPtrTraits> Cs,
-    const torch::PackedTensorAccessor32<long,1,torch::RestrictPtrTraits> ii,
-    const torch::PackedTensorAccessor32<long,1,torch::RestrictPtrTraits> jj,
-    const torch::PackedTensorAccessor32<long,2,torch::RestrictPtrTraits> idx_ii2_jj,
-    const torch::PackedTensorAccessor32<bool,3,torch::RestrictPtrTraits> valid_match,
-    const torch::PackedTensorAccessor32<float,3,torch::RestrictPtrTraits> Q,
-    torch::PackedTensorAccessor32<float,4,torch::RestrictPtrTraits> Hs,
-    torch::PackedTensorAccessor32<float,3,torch::RestrictPtrTraits> gs,
-    const float sigma_point,
-    const float C_thresh,
-    const float Q_thresh)
-{
- 
-  // Twc and Xs first dim is number of poses
-  // ii, jj, Cii, Cjj, Q first dim is number of edges
- 
-  const int block_id = blockIdx.x;
-  const int thread_id = threadIdx.x;
- 
-  const int num_points = Xs.size(1);
- 
-  int ix = static_cast<int>(ii[block_id]);
-  int jx = static_cast<int>(jj[block_id]);
- 
-  __shared__ float ti[3], tj[3], tij[3];
-  __shared__ float qi[4], qj[4], qij[4];
-  __shared__ float si[1], sj[1], sij[1];
- 
-  __syncthreads();
- 
-  // load poses from global memory
-  if (thread_id < 3) {
-    ti[thread_id] = Twc[ix][thread_id];
-    tj[thread_id] = Twc[jx][thread_id];
-  }
- 
-  if (thread_id < 4) {
-    qi[thread_id] = Twc[ix][thread_id+3];
-    qj[thread_id] = Twc[jx][thread_id+3];
-  }
- 
-  if (thread_id < 1) {
-    si[thread_id] = Twc[ix][thread_id+7];
-    sj[thread_id] = Twc[jx][thread_id+7];
-  }
- 
-  __syncthreads();
- 
-  // Calculate relative poses
-  if (thread_id == 0) {
-    relSim3(ti, qi, si, tj, qj, sj, tij, qij, sij);
-  }
- 
-  __syncthreads();
- 
-  // //points
-  float Xi[3];
-  float Xj[3];
-  float Xj_Ci[3];
- 
-  // residuals
-  float err[3];
-  float w[3];
- 
-  // // jacobians
-  float Jx[14];
-  // float Jz;
- 
-  float* Ji = &Jx[0];
-  float* Jj = &Jx[7];
- 
-  // hessians
-  const int h_dim = 14*(14+1)/2;
-  float hij[h_dim];
- 
-  float vi[7], vj[7];
- 
-  int l; // We reuse this variable later for Hessian fill-in
-  for (l=0; l<h_dim; l++) {
-    hij[l] = 0;
-  }
- 
-  for (int n=0; n<7; n++) {
-    vi[n] = 0;
-    vj[n] = 0;
-  }
- 
-    // Parameters
-  const float sigma_point_inv = 1.0/sigma_point;
- 
-  __syncthreads();
- 
-  GPU_1D_KERNEL_LOOP(k, num_points) {
- 
-    // Get points
-    const bool valid_match_ind = valid_match[block_id][k][0]; 
-    const int64_t ind_Xi = valid_match_ind ? idx_ii2_jj[block_id][k] : 0;
-
-    Xi[0] = Xs[ix][ind_Xi][0];
-    Xi[1] = Xs[ix][ind_Xi][1];
-    Xi[2] = Xs[ix][ind_Xi][2];
- 
-    Xj[0] = Xs[jx][k][0];
-    Xj[1] = Xs[jx][k][1];
-    Xj[2] = Xs[jx][k][2];
- 
-    // Transform point
-    actSim3(tij, qij, sij, Xj, Xj_Ci);
- 
-    // Error (difference in camera rays)
-    err[0] = Xj_Ci[0] - Xi[0];
-    err[1] = Xj_Ci[1] - Xi[1];
-    err[2] = Xj_Ci[2] - Xi[2];
- 
-    // Weights (Huber)
-    const float q = Q[block_id][k][0];
-    const float ci = Cs[ix][ind_Xi][0];
-    const float cj = Cs[jx][k][0];
-    const bool valid = 
-      valid_match_ind
-      & (q > Q_thresh)
-      & (ci > C_thresh)
-      & (cj > C_thresh);
-
-    // Weight using confidences
-    const float conf_weight = q;
-    // const float conf_weight = q * ci * cj;
-    
-    const float sqrt_w_point = valid ? sigma_point_inv * sqrtf(conf_weight) : 0;
- 
-    // Robust weight
-    w[0] = huber(sqrt_w_point * err[0]);
-    w[1] = huber(sqrt_w_point * err[1]);
-    w[2] = huber(sqrt_w_point * err[2]);
-    
-    // Add back in sigma
-    const float w_const_point = sqrt_w_point * sqrt_w_point;
-    w[0] *= w_const_point;
-    w[1] *= w_const_point;
-    w[2] *= w_const_point;
- 
-    // Jacobians
-    
-    // x coordinate
-    Ji[0] = 1.0;
-    Ji[1] = 0.0;
-    Ji[2] = 0.0;
-    Ji[3] = 0.0;
-    Ji[4] = Xj_Ci[2]; // z
-    Ji[5] = -Xj_Ci[1]; // -y
-    Ji[6] = Xj_Ci[0]; // x
-
-    apply_Sim3_adj_inv(ti, qi, si, Ji, Jj);
-    for (int n=0; n<7; n++) Ji[n] = -Jj[n];
-
-    l=0;
-    for (int n=0; n<14; n++) {
-      for (int m=0; m<=n; m++) {
-        hij[l] += w[0] * Jx[n] * Jx[m];
-        l++;
-      }
-    }
- 
-    for (int n=0; n<7; n++) {
-      vi[n] += w[0] * err[0] * Ji[n];
-      vj[n] += w[0] * err[0] * Jj[n];
-    }
- 
-    // y coordinate
-    Ji[0] = 0.0;
-    Ji[1] = 1.0;
-    Ji[2] = 0.0;
-    Ji[3] = -Xj_Ci[2]; // -z
-    Ji[4] = 0; 
-    Ji[5] = Xj_Ci[0]; // x
-    Ji[6] = Xj_Ci[1]; // y
- 
-    apply_Sim3_adj_inv(ti, qi, si, Ji, Jj);
-    for (int n=0; n<7; n++) Ji[n] = -Jj[n];
-
-    l=0;
-    for (int n=0; n<14; n++) {
-      for (int m=0; m<=n; m++) {
-        hij[l] += w[1] * Jx[n] * Jx[m];
-        l++;
-      }
-    }
- 
-    for (int n=0; n<7; n++) {
-      vi[n] += w[1] * err[1] * Ji[n];
-      vj[n] += w[1] * err[1] * Jj[n];
-    }
- 
-    // z coordinate
-    Ji[0] = 0.0;
-    Ji[1] = 0.0;
-    Ji[2] = 1.0;
-    Ji[3] = Xj_Ci[1]; // y
-    Ji[4] = -Xj_Ci[0]; // -x 
-    Ji[5] = 0;
-    Ji[6] = Xj_Ci[2]; // z
- 
-    apply_Sim3_adj_inv(ti, qi, si, Ji, Jj);
-    for (int n=0; n<7; n++) Ji[n] = -Jj[n];
-
-    l=0;
-    for (int n=0; n<14; n++) {
-      for (int m=0; m<=n; m++) {
-        hij[l] += w[2] * Jx[n] * Jx[m];
-        l++;
-      }
-    }
- 
-    for (int n=0; n<7; n++) {
-      vi[n] += w[2] * err[2] * Ji[n];
-      vj[n] += w[2] * err[2] * Jj[n];
-    }
- 
- 
-  }
- 
-  __syncthreads();
- 
-  __shared__ float sdata[THREADS];
-  for (int n=0; n<7; n++) {
-    sdata[threadIdx.x] = vi[n];
-    blockReduce(sdata);
-    if (threadIdx.x == 0) {
-      gs[0][block_id][n] = sdata[0];
-    }
- 
-    __syncthreads();
- 
-    sdata[threadIdx.x] = vj[n];
-    blockReduce(sdata);
-    if (threadIdx.x == 0) {
-      gs[1][block_id][n] = sdata[0];
-    }
- 
-  }
- 
-  l=0;
-  for (int n=0; n<14; n++) {
-    for (int m=0; m<=n; m++) {
-      sdata[threadIdx.x] = hij[l];
-      blockReduce(sdata);
- 
-      if (threadIdx.x == 0) {
-        if (n<7 && m<7) {
-          Hs[0][block_id][n][m] = sdata[0];
-          Hs[0][block_id][m][n] = sdata[0];
-        }
-        else if (n >=7 && m<7) {
-          Hs[1][block_id][m][n-7] = sdata[0];
-          Hs[2][block_id][n-7][m] = sdata[0];
-        }
-        else {
-          Hs[3][block_id][n-7][m-7] = sdata[0];
-          Hs[3][block_id][m-7][n-7] = sdata[0];
-        }
-      }
- 
-      l++;
-    }
-  }
+__device__ void quat_to_rot(const float* q, float* R) {
+    float qx = q[0], qy = q[1], qz = q[2], qw = q[3];
+    R[0] = 1 - 2*qy*qy - 2*qz*qz;  // R[0,0]
+    R[1] = 2*qx*qy - 2*qz*qw;       // R[0,1]
+    R[2] = 2*qx*qz + 2*qy*qw;       // R[0,2]
+    R[3] = 2*qx*qy + 2*qz*qw;       // R[1,0]
+    R[4] = 1 - 2*qx*qx - 2*qz*qz;  // R[1,1]
+    R[5] = 2*qy*qz - 2*qx*qw;       // R[1,2]
+    R[6] = 2*qx*qz - 2*qy*qw;       // R[2,0]
+    R[7] = 2*qy*qz + 2*qx*qw;       // R[2,1]
+    R[8] = 1 - 2*qx*qx - 2*qy*qy;  // R[2,2]
 }
 
-std::vector<torch::Tensor> gauss_newton_points_cuda(
-  torch::Tensor Twc, torch::Tensor Xs, torch::Tensor Cs,
-  torch::Tensor ii, torch::Tensor jj, 
-  torch::Tensor idx_ii2jj, torch::Tensor valid_match,
-  torch::Tensor Q,
-  const float sigma_point,
-  const float C_thresh,
-  const float Q_thresh,
-  const int max_iter,
-  const float delta_thresh)
-{
-  auto opts = Twc.options();
-  const int num_edges = ii.size(0);
-  const int num_poses = Xs.size(0);
-  const int n = Xs.size(1);
-
-  const int num_fix = 1;
-
-  // Setup indexing
-  torch::Tensor unique_kf_idx = get_unique_kf_idx(ii, jj);
-  // For edge construction
-  std::vector<torch::Tensor> inds = create_inds(unique_kf_idx, 0, ii, jj);
-  torch::Tensor ii_edge = inds[0];
-  torch::Tensor jj_edge = inds[1];
-  // For linear system indexing (pin=2 because fixing first two poses)
-  std::vector<torch::Tensor> inds_opt = create_inds(unique_kf_idx, num_fix, ii, jj);
-  torch::Tensor ii_opt = inds_opt[0];
-  torch::Tensor jj_opt = inds_opt[1];
-
-  const int pose_dim = 7; // sim3
-
-  // initialize buffers
-  torch::Tensor Hs = torch::zeros({4, num_edges, pose_dim, pose_dim}, opts);
-  torch::Tensor gs = torch::zeros({2, num_edges, pose_dim}, opts);
-
-  // For debugging outputs
-  torch::Tensor dx;
-
-  torch::Tensor delta_norm;
-
-  for (int itr=0; itr<max_iter; itr++) {
-
-    point_align_kernel<<<num_edges, THREADS>>>(
-      Twc.packed_accessor32<float,2,torch::RestrictPtrTraits>(),
-      Xs.packed_accessor32<float,3,torch::RestrictPtrTraits>(),
-      Cs.packed_accessor32<float,3,torch::RestrictPtrTraits>(),
-      ii_edge.packed_accessor32<long,1,torch::RestrictPtrTraits>(),
-      jj_edge.packed_accessor32<long,1,torch::RestrictPtrTraits>(),
-      idx_ii2jj.packed_accessor32<long,2,torch::RestrictPtrTraits>(),
-      valid_match.packed_accessor32<bool,3,torch::RestrictPtrTraits>(),
-      Q.packed_accessor32<float,3,torch::RestrictPtrTraits>(),
-      Hs.packed_accessor32<float,4,torch::RestrictPtrTraits>(),
-      gs.packed_accessor32<float,3,torch::RestrictPtrTraits>(),
-      sigma_point, C_thresh, Q_thresh
-    );
-
-
-    // pose x pose block
-    SparseBlock A(num_poses - num_fix, pose_dim);
-
-    A.update_lhs(Hs.reshape({-1, pose_dim, pose_dim}), 
-        torch::cat({ii_opt, ii_opt, jj_opt, jj_opt}), 
-        torch::cat({ii_opt, jj_opt, ii_opt, jj_opt}));
-
-    A.update_rhs(gs.reshape({-1, pose_dim}), 
-        torch::cat({ii_opt, jj_opt}));
-
-    // NOTE: Accounting for negative here!
-    dx = -A.solve();
-    
-    pose_retr_kernel<<<1, THREADS>>>(
-      Twc.packed_accessor32<float,2,torch::RestrictPtrTraits>(),
-      dx.packed_accessor32<float,2,torch::RestrictPtrTraits>(),
-      num_fix);
-
-    // Termination criteria
-    // Need to specify this second argument otherwise ambiguous function call...
-    delta_norm = torch::linalg::norm(dx, std::optional<c10::Scalar>(), {}, false, {});
-    if (delta_norm.item<float>() < delta_thresh) {
-      break;
-    }
-        
-
-  }
-
-  return {dx}; // For debugging
-}
 
 __global__ void ray_align_kernel(
     const torch::PackedTensorAccessor32<float,2,torch::RestrictPtrTraits> Twc,
@@ -1146,6 +867,7 @@ std::vector<torch::Tensor> gauss_newton_rays_cuda(
   const float sigma_dist,
   const float C_thresh,
   const float Q_thresh,
+  const int num_fix,
   const int max_iter,
   const float delta_thresh)
 {
@@ -1153,8 +875,6 @@ std::vector<torch::Tensor> gauss_newton_rays_cuda(
   const int num_edges = ii.size(0);
   const int num_poses = Xs.size(0);
   const int n = Xs.size(1);
-
-  const int num_fix = 1;
 
   // Setup indexing
   torch::Tensor unique_kf_idx = get_unique_kf_idx(ii, jj);
@@ -1209,6 +929,10 @@ std::vector<torch::Tensor> gauss_newton_rays_cuda(
     dx = -A.solve();
 
     //
+    // pose_retr_kernel_right<<<1, THREADS>>>(
+    //   Twc.packed_accessor32<float,2,torch::RestrictPtrTraits>(),
+    //   dx.packed_accessor32<float,2,torch::RestrictPtrTraits>(),
+    //   num_fix);
     pose_retr_kernel<<<1, THREADS>>>(
       Twc.packed_accessor32<float,2,torch::RestrictPtrTraits>(),
       dx.packed_accessor32<float,2,torch::RestrictPtrTraits>(),
@@ -1227,6 +951,647 @@ std::vector<torch::Tensor> gauss_newton_rays_cuda(
   return {dx}; // For debugging
 }
 
+__global__ void odom_constraint_kernel(
+    // Inputs
+    const torch::PackedTensorAccessor32<float,2,torch::RestrictPtrTraits> Twc,      // World poses (N, 8) [tx, ty, tz, qx, qy, qz, qw, s]
+    const torch::PackedTensorAccessor32<float,2,torch::RestrictPtrTraits> T_meas_ij, // Measured relative poses (num_odom, 8)
+    const torch::PackedTensorAccessor32<long,1,torch::RestrictPtrTraits> odom_ii,   // Indices i for odometry edges
+    const torch::PackedTensorAccessor32<long,1,torch::RestrictPtrTraits> odom_jj,   // Indices j for odometry edges
+    const float sigma_odom,                                                       // Odometry standard deviation (scalar)
+    // Outputs
+    torch::PackedTensorAccessor32<float,4,torch::RestrictPtrTraits> Hs,             // Output Hessian blocks (4, num_odom, 7, 7)
+    torch::PackedTensorAccessor32<float,3,torch::RestrictPtrTraits> gs              // Output Gradient blocks (2, num_odom, 7)
+) {
+    // --- Thread Indexing ---
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // --- Get Pose Indices ---
+    int ix = static_cast<int>(odom_ii[idx]);
+    int jx = static_cast<int>(odom_jj[idx]);
+
+    // --- Load Poses and Measurement into Local Variables (Registers) ---
+    float ti[3], qi[4], si[1];
+    float tj[3], qj[4], sj[1];
+    float t_meas_ij[3], q_meas_ij[4], s_meas_ij[1];
+
+    // Load pose i (World frame)
+    si[0] = Twc[ix][7];
+    for(int k=0; k<3; ++k) ti[k] = Twc[ix][k];
+    for(int k=0; k<4; ++k) qi[k] = Twc[ix][k+3];
+
+    // Load pose j (World frame)
+    sj[0] = Twc[jx][7];
+    for(int k=0; k<3; ++k) tj[k] = Twc[jx][k];
+    for(int k=0; k<4; ++k) qj[k] = Twc[jx][k+3];
+
+    // Load measurement T_meas_ij (Relative pose j in i's frame)
+    s_meas_ij[0] = T_meas_ij[idx][7];
+    for(int k=0; k<3; ++k) t_meas_ij[k] = T_meas_ij[idx][k];
+    for(int k=0; k<4; ++k) q_meas_ij[k] = T_meas_ij[idx][k+3];
+
+    // --- Precomputations ---
+    float R_i[9];  // Rotation matrix for pose i (world to body_i), Column Major
+    float d[3];    // World frame difference: t_j - t_i (Needed for Right Perturbation Jacobian)
+
+    quat_to_rot(qi, R_i); // R_i is column-major storage for R_wb(i)
+    for(int k=0; k<3; ++k) d[k] = tj[k] - ti[k]; // d = tj - ti
+
+    // --- Compute Estimated Relative Transformation T_ij = T_i^{-1} * T_j ---
+    float tij[3], qij[4], sij[1];
+    relSim3(ti, qi, si, tj, qj, sj, tij, qij, sij);
+
+    // --- Compute Residuals ---
+    float err[7]; // [err_tx, err_ty, err_tz, err_rx, err_ry, err_rz, err_s]
+    // Translation residual: e_t = t_ij - t_meas_ij
+    for (int k = 0; k < 3; k++) err[k] = tij[k] - t_meas_ij[k];
+    // Rotation residual: e_r approx 2 * vec(q_ij * q_meas_ij^{-1})
+    float q_meas_ij_inv[4]; quat_inv(q_meas_ij, q_meas_ij_inv);
+    float q_err[4]; quat_comp(qij, q_meas_ij_inv, q_err);
+    err[3] = 2.0f * q_err[0]; err[4] = 2.0f * q_err[1]; err[5] = 2.0f * q_err[2];
+    if (q_err[3] < 0.0f) { err[3] *= -1.0f; err[4] *= -1.0f; err[5] *= -1.0f; }
+    // Scale residual: e_s = log(s_ij / s_meas_ij)
+    err[6] = logf(sij[0] / s_meas_ij[0]);
+
+    // --- Compute Weights ---
+    float w[7];   // Robust weights: w_k = Info * huber_weight_k
+    const float sigma_odom_inv_sq = 1.0f / (sigma_odom * sigma_odom);
+    const float sqrt_info = 1.0f / sigma_odom;
+    for (int k = 0; k < 7; k++) {
+        float weighted_err = sqrt_info * err[k];
+        w[k] = sigma_odom_inv_sq * huber(weighted_err);
+    }
+
+    // --- Compute Jacobians and Accumulate H/g ---
+    float Jx[14]; float* Ji = &Jx[0]; float* Jj = &Jx[7];
+    const int h_dim = 105; float hij[h_dim]; // 14*(14+1)/2 = 105
+    float vi[7], vj[7];
+    for (int l = 0; l < h_dim; ++l) hij[l] = 0.0f;
+    for (int n = 0; n < 7; ++n) { vi[n] = 0.0f; vj[n] = 0.0f; }
+
+    // --- Process Translation Residuals (k=0, 1, 2 for err[0], err[1], err[2]) ---
+    for (int k = 0; k < 3; ++k) {
+        for (int n = 0; n < 7; ++n) { Ji[n] = 0.0f; Jj[n] = 0.0f; } // Clear Jacobians
+
+        // Derivatives of err_t[k] w.r.t delta_xi^R, delta_xj^R (RIGHT Perturbation)
+        float common_scale = 1.0f / si[0];
+
+        // ∂err_t[k] / ∂delta_t_i^R = -(1/s_i) * R_i^T_row_k
+        Ji[0] = -common_scale * R_i[0 * 3 + k];
+        Ji[1] = -common_scale * R_i[1 * 3 + k];
+        Ji[2] = -common_scale * R_i[2 * 3 + k];
+
+        // ∂err_t[k] / ∂delta_t_j^R = (1/s_i) * R_i^T_row_k
+        Jj[0] = common_scale * R_i[0 * 3 + k];
+        Jj[1] = common_scale * R_i[1 * 3 + k];
+        Jj[2] = common_scale * R_i[2 * 3 + k];
+
+        // ∂err_t[k] / ∂delta_theta_i^R = (1/s_i) * [R_i^T * skew(d)]_row_k
+        Ji[3] = common_scale * (R_i[1 * 3 + k] * d[2] - R_i[2 * 3 + k] * d[1]);
+        Ji[4] = common_scale * (R_i[2 * 3 + k] * d[0] - R_i[0 * 3 + k] * d[2]);
+        Ji[5] = common_scale * (R_i[0 * 3 + k] * d[1] - R_i[1 * 3 + k] * d[0]);
+
+        // ∂err_t[k] / ∂delta_s_i^R = -(1/s_i) * (R_i^T * d)[k]
+        Ji[6] = -common_scale * (R_i[0 * 3 + k] * d[0] + R_i[1 * 3 + k] * d[1] + R_i[2 * 3 + k] * d[2]);
+
+        // ∂err_t[k] / ∂delta_theta_j^R = 0 (For Right Perturbation)
+        Jj[3] = 0.0f;
+        Jj[4] = 0.0f;
+        Jj[5] = 0.0f;
+
+        // ∂err_t[k] / ∂delta_s_j^R = 0 (For Right Perturbation)
+        Jj[6] = 0.0f;
+
+        // Accumulate H += J^T * w[k] * J and g += J^T * w[k] * err[k]
+        float weight = w[k]; float error = err[k]; int l = 0;
+        for (int n = 0; n < 14; ++n) { for (int m = 0; m <= n; ++m) { hij[l] += weight * Jx[n] * Jx[m]; l++; } }
+        for (int n = 0; n < 7; ++n) { vi[n] += weight * error * Ji[n]; vj[n] += weight * error * Jj[n]; }
+    }
+
+    // --- Process Rotation Residuals (k=0, 1, 2 for err[3], err[4], err[5]) ---
+    // Jacobians w.r.t. Right Perturbation are approx -I and +I (same as left approx)
+    for (int k = 0; k < 3; ++k) {
+        for (int n = 0; n < 7; ++n) { Ji[n] = 0.0f; Jj[n] = 0.0f; } // Clear Jacobians
+        Ji[k + 3] = -1.0f; // ∂err_rot[k] / ∂delta_theta_i^R[k] ≈ -1
+        Jj[k + 3] = 1.0f;  // ∂err_rot[k] / ∂delta_theta_j^R[k] ≈ 1
+
+        // Accumulate H/g
+        float weight = w[k + 3]; float error = err[k + 3]; int l = 0;
+        for (int n = 0; n < 14; ++n) { for (int m = 0; m <= n; ++m) { hij[l] += weight * Jx[n] * Jx[m]; l++; } }
+        for (int n = 0; n < 7; ++n) { vi[n] += weight * error * Ji[n]; vj[n] += weight * error * Jj[n]; }
+    }
+
+    // --- Process Scale Residual (using err[6], w[6]) ---
+    // Jacobians w.r.t. Right Perturbation are -1 and +1 (same as left)
+    for (int n = 0; n < 7; ++n) { Ji[n] = 0.0f; Jj[n] = 0.0f; } // Clear Jacobians
+    Ji[6] = -1.0f; // ∂err_s / ∂delta_s_i^R = -1
+    Jj[6] = 1.0f;  // ∂err_s / ∂delta_s_j^R = 1
+
+    // Accumulate H/g
+    float weight = w[6]; float error = err[6]; int l = 0;
+    for (int n = 0; n < 14; ++n) { for (int m = 0; m <= n; ++m) { hij[l] += weight * Jx[n] * Jx[m]; l++; } }
+    for (int n = 0; n < 7; ++n) { vi[n] += weight * error * Ji[n]; vj[n] += weight * error * Jj[n]; }
+
+    // --- Write results directly to Global Memory ---
+    // Gradients g_i, g_j (J^T * W * err)
+    for (int n = 0; n < 7; ++n) { gs[0][idx][n] = vi[n]; gs[1][idx][n] = vj[n]; }
+    // Hessian blocks H_ii, H_ij, H_ji, H_jj (J^T * W * J)
+    l = 0;
+    for (int n = 0; n < 14; ++n) { for (int m = 0; m <= n; ++m) {
+            float val = hij[l];
+            if (n < 7) { // Row i
+                if (m < 7) { // Col i -> H_ii
+                    Hs[0][idx][n][m] = val; if (n != m) Hs[0][idx][m][n] = val;
+                } else { // Col j -> H_ij / H_ji
+                    Hs[1][idx][n][m - 7] = val; Hs[2][idx][m - 7][n] = val;
+                }
+            } else { // Row j
+                 if (m >= 7) { // Col j -> H_jj
+                    Hs[3][idx][n - 7][m - 7] = val; if (n != m) Hs[3][idx][m - 7][n - 7] = val;
+                }
+            } l++; } }
+}
+
+std::vector<torch::Tensor> gauss_newton_rays_odom_cuda(
+  torch::Tensor Twc, torch::Tensor Xs, torch::Tensor Cs,
+  torch::Tensor ii, torch::Tensor jj, 
+  torch::Tensor idx_ii2jj, torch::Tensor valid_match,
+  torch::Tensor Q,
+  torch::Tensor odom_ii, torch::Tensor odom_jj, // odom edges, from i to j
+  torch::Tensor Tij, // Tj in Ti, or delta T between i and j
+  const float sigma_odom,
+  const float sigma_ray,
+  const float sigma_dist,
+  const float C_thresh,
+  const float Q_thresh,
+  const int num_fix,
+  const int max_iter,
+  const float delta_thresh)
+{
+  auto opts = Twc.options();
+  const int num_edges = ii.size(0);
+  const int num_odom_edges = odom_ii.size(0);
+  const int num_poses = Xs.size(0);
+  const int n = Xs.size(1);
+
+  // Setup indexing
+  torch::Tensor unique_kf_idx = get_unique_kf_idx(ii, jj);
+  // For edge construction
+  std::vector<torch::Tensor> inds = create_inds(unique_kf_idx, 0, ii, jj);
+  torch::Tensor ii_edge = inds[0];
+  torch::Tensor jj_edge = inds[1];
+  // For linear system indexing (pin=2 because fixing first two poses)
+  std::vector<torch::Tensor> inds_opt = create_inds(unique_kf_idx, num_fix, ii, jj);
+  torch::Tensor ii_opt = inds_opt[0];
+  torch::Tensor jj_opt = inds_opt[1];
+
+  // For odometry edges
+  std::vector<torch::Tensor> odom_inds_opt = create_inds(unique_kf_idx, num_fix, odom_ii, odom_jj);
+  torch::Tensor odom_ii_opt = odom_inds_opt[0];
+  torch::Tensor odom_jj_opt = odom_inds_opt[1];
+
+  const int pose_dim = 7; // sim3
+
+  // initialize buffers
+  torch::Tensor Hs = torch::zeros({4, num_edges, pose_dim, pose_dim}, opts);
+  torch::Tensor gs = torch::zeros({2, num_edges, pose_dim}, opts);
+  
+  // Buffers for odometry constraints
+  torch::Tensor Hs_odom = torch::zeros({4, num_odom_edges, pose_dim, pose_dim}, opts);
+  torch::Tensor gs_odom = torch::zeros({2, num_odom_edges, pose_dim}, opts);
+
+  // For debugging outputs
+  torch::Tensor dx;
+
+  torch::Tensor delta_norm;
+
+  for (int itr=0; itr<max_iter; itr++) {
+    // Visual constraints
+    ray_align_kernel<<<num_edges, THREADS>>>(
+      Twc.packed_accessor32<float,2,torch::RestrictPtrTraits>(),
+      Xs.packed_accessor32<float,3,torch::RestrictPtrTraits>(),
+      Cs.packed_accessor32<float,3,torch::RestrictPtrTraits>(),
+      ii_edge.packed_accessor32<long,1,torch::RestrictPtrTraits>(),
+      jj_edge.packed_accessor32<long,1,torch::RestrictPtrTraits>(),
+      idx_ii2jj.packed_accessor32<long,2,torch::RestrictPtrTraits>(),
+      valid_match.packed_accessor32<bool,3,torch::RestrictPtrTraits>(),
+      Q.packed_accessor32<float,3,torch::RestrictPtrTraits>(),
+      Hs.packed_accessor32<float,4,torch::RestrictPtrTraits>(),
+      gs.packed_accessor32<float,3,torch::RestrictPtrTraits>(),
+      sigma_ray, sigma_dist, C_thresh, Q_thresh
+    );
+
+    // Odometry constraints
+    if (num_odom_edges > 0) {
+      odom_constraint_kernel<<<num_odom_edges, THREADS>>>(
+        Twc.packed_accessor32<float,2,torch::RestrictPtrTraits>(),
+        Tij.packed_accessor32<float,2,torch::RestrictPtrTraits>(),
+        odom_ii.packed_accessor32<long,1,torch::RestrictPtrTraits>(),
+        odom_jj.packed_accessor32<long,1,torch::RestrictPtrTraits>(),
+        sigma_odom,
+        Hs_odom.packed_accessor32<float,4,torch::RestrictPtrTraits>(),
+        gs_odom.packed_accessor32<float,3,torch::RestrictPtrTraits>()
+      );
+    }
+
+    // pose x pose block
+    SparseBlock A(num_poses - num_fix, pose_dim);
+
+    // Add visual constraints
+    A.update_lhs(Hs.reshape({-1, pose_dim, pose_dim}), 
+        torch::cat({ii_opt, ii_opt, jj_opt, jj_opt}), 
+        torch::cat({ii_opt, jj_opt, ii_opt, jj_opt}));
+
+    A.update_rhs(gs.reshape({-1, pose_dim}), 
+        torch::cat({ii_opt, jj_opt}));
+    
+    // Add odometry constraints if available
+    if (num_odom_edges > 0) {
+      A.update_lhs(Hs_odom.reshape({-1, pose_dim, pose_dim}), 
+          torch::cat({odom_ii_opt, odom_ii_opt, odom_jj_opt, odom_jj_opt}), 
+          torch::cat({odom_ii_opt, odom_jj_opt, odom_ii_opt, odom_jj_opt}));
+
+      A.update_rhs(gs_odom.reshape({-1, pose_dim}), 
+          torch::cat({odom_ii_opt, odom_jj_opt}));
+    }
+
+    // NOTE: Accounting for negative here!
+    dx = -A.solve();
+
+    //
+    pose_retr_kernel<<<1, THREADS>>>(
+      Twc.packed_accessor32<float,2,torch::RestrictPtrTraits>(),
+      dx.packed_accessor32<float,2,torch::RestrictPtrTraits>(),
+      num_fix);
+
+    // Termination criteria
+    // Need to specify this second argument otherwise ambiguous function call...
+    delta_norm = torch::linalg::linalg_norm(dx, std::optional<c10::Scalar>(), {}, false, {});
+    if (delta_norm.item<float>() < delta_thresh) {
+      break;
+    }
+  }
+
+  return {dx}; // For debugging
+}
+
+__global__ void point_align_kernel(
+    const torch::PackedTensorAccessor32<float,2,torch::RestrictPtrTraits> Twc,
+    const torch::PackedTensorAccessor32<float,3,torch::RestrictPtrTraits> Xs,
+    const torch::PackedTensorAccessor32<float,3,torch::RestrictPtrTraits> Cs,
+    const torch::PackedTensorAccessor32<long,1,torch::RestrictPtrTraits> ii,
+    const torch::PackedTensorAccessor32<long,1,torch::RestrictPtrTraits> jj,
+    const torch::PackedTensorAccessor32<long,2,torch::RestrictPtrTraits> idx_ii2_jj,
+    const torch::PackedTensorAccessor32<bool,3,torch::RestrictPtrTraits> valid_match,
+    const torch::PackedTensorAccessor32<float,3,torch::RestrictPtrTraits> Q,
+    torch::PackedTensorAccessor32<float,4,torch::RestrictPtrTraits> Hs,
+    torch::PackedTensorAccessor32<float,3,torch::RestrictPtrTraits> gs,
+    const float sigma_point,
+    const float C_thresh,
+    const float Q_thresh)
+{
+ 
+  // Twc and Xs first dim is number of poses
+  // ii, jj, Cii, Cjj, Q first dim is number of edges
+ 
+  const int block_id = blockIdx.x;
+  const int thread_id = threadIdx.x;
+ 
+  const int num_points = Xs.size(1);
+ 
+  int ix = static_cast<int>(ii[block_id]);
+  int jx = static_cast<int>(jj[block_id]);
+ 
+  __shared__ float ti[3], tj[3], tij[3];
+  __shared__ float qi[4], qj[4], qij[4];
+  __shared__ float si[1], sj[1], sij[1];
+ 
+  __syncthreads();
+ 
+  // load poses from global memory
+  if (thread_id < 3) {
+    ti[thread_id] = Twc[ix][thread_id];
+    tj[thread_id] = Twc[jx][thread_id];
+  }
+ 
+  if (thread_id < 4) {
+    qi[thread_id] = Twc[ix][thread_id+3];
+    qj[thread_id] = Twc[jx][thread_id+3];
+  }
+ 
+  if (thread_id < 1) {
+    si[thread_id] = Twc[ix][thread_id+7];
+    sj[thread_id] = Twc[jx][thread_id+7];
+  }
+ 
+  __syncthreads();
+ 
+  // Calculate relative poses
+  if (thread_id == 0) {
+    relSim3(ti, qi, si, tj, qj, sj, tij, qij, sij);
+  }
+ 
+  __syncthreads();
+ 
+  // //points
+  float Xi[3];
+  float Xj[3];
+  float Xj_Ci[3];
+ 
+  // residuals
+  float err[3];
+  float w[3];
+ 
+  // // jacobians
+  float Jx[14];
+  // float Jz;
+ 
+  float* Ji = &Jx[0];
+  float* Jj = &Jx[7];
+ 
+  // hessians
+  const int h_dim = 14*(14+1)/2;
+  float hij[h_dim];
+ 
+  float vi[7], vj[7];
+ 
+  int l; // We reuse this variable later for Hessian fill-in
+  for (l=0; l<h_dim; l++) {
+    hij[l] = 0;
+  }
+ 
+  for (int n=0; n<7; n++) {
+    vi[n] = 0;
+    vj[n] = 0;
+  }
+ 
+    // Parameters
+  const float sigma_point_inv = 1.0/sigma_point;
+ 
+  __syncthreads();
+ 
+  GPU_1D_KERNEL_LOOP(k, num_points) {
+ 
+    // Get points
+    const bool valid_match_ind = valid_match[block_id][k][0]; 
+    const int64_t ind_Xi = valid_match_ind ? idx_ii2_jj[block_id][k] : 0;
+
+    Xi[0] = Xs[ix][ind_Xi][0];
+    Xi[1] = Xs[ix][ind_Xi][1];
+    Xi[2] = Xs[ix][ind_Xi][2];
+ 
+    Xj[0] = Xs[jx][k][0];
+    Xj[1] = Xs[jx][k][1];
+    Xj[2] = Xs[jx][k][2];
+ 
+    // Transform point
+    actSim3(tij, qij, sij, Xj, Xj_Ci);
+ 
+    // Error (difference in camera rays)
+    err[0] = Xj_Ci[0] - Xi[0];
+    err[1] = Xj_Ci[1] - Xi[1];
+    err[2] = Xj_Ci[2] - Xi[2];
+ 
+    // Weights (Huber)
+    const float q = Q[block_id][k][0];
+    const float ci = Cs[ix][ind_Xi][0];
+    const float cj = Cs[jx][k][0];
+    const bool valid = 
+      valid_match_ind
+      & (q > Q_thresh)
+      & (ci > C_thresh)
+      & (cj > C_thresh);
+
+    // Weight using confidences
+    const float conf_weight = q;
+    // const float conf_weight = q * ci * cj;
+    
+    const float sqrt_w_point = valid ? sigma_point_inv * sqrtf(conf_weight) : 0;
+ 
+    // Robust weight
+    w[0] = huber(sqrt_w_point * err[0]);
+    w[1] = huber(sqrt_w_point * err[1]);
+    w[2] = huber(sqrt_w_point * err[2]);
+    
+    // Add back in sigma
+    const float w_const_point = sqrt_w_point * sqrt_w_point;
+    w[0] *= w_const_point;
+    w[1] *= w_const_point;
+    w[2] *= w_const_point;
+ 
+    // Jacobians
+    
+    // x coordinate
+    Ji[0] = 1.0;
+    Ji[1] = 0.0;
+    Ji[2] = 0.0;
+    Ji[3] = 0.0;
+    Ji[4] = Xj_Ci[2]; // z
+    Ji[5] = -Xj_Ci[1]; // -y
+    Ji[6] = Xj_Ci[0]; // x
+
+    apply_Sim3_adj_inv(ti, qi, si, Ji, Jj);
+    for (int n=0; n<7; n++) Ji[n] = -Jj[n];
+
+    l=0;
+    for (int n=0; n<14; n++) {
+      for (int m=0; m<=n; m++) {
+        hij[l] += w[0] * Jx[n] * Jx[m];
+        l++;
+      }
+    }
+ 
+    for (int n=0; n<7; n++) {
+      vi[n] += w[0] * err[0] * Ji[n];
+      vj[n] += w[0] * err[0] * Jj[n];
+    }
+ 
+    // y coordinate
+    Ji[0] = 0.0;
+    Ji[1] = 1.0;
+    Ji[2] = 0.0;
+    Ji[3] = -Xj_Ci[2]; // -z
+    Ji[4] = 0; 
+    Ji[5] = Xj_Ci[0]; // x
+    Ji[6] = Xj_Ci[1]; // y
+ 
+    apply_Sim3_adj_inv(ti, qi, si, Ji, Jj);
+    for (int n=0; n<7; n++) Ji[n] = -Jj[n];
+
+    l=0;
+    for (int n=0; n<14; n++) {
+      for (int m=0; m<=n; m++) {
+        hij[l] += w[1] * Jx[n] * Jx[m];
+        l++;
+      }
+    }
+ 
+    for (int n=0; n<7; n++) {
+      vi[n] += w[1] * err[1] * Ji[n];
+      vj[n] += w[1] * err[1] * Jj[n];
+    }
+ 
+    // z coordinate
+    Ji[0] = 0.0;
+    Ji[1] = 0.0;
+    Ji[2] = 1.0;
+    Ji[3] = Xj_Ci[1]; // y
+    Ji[4] = -Xj_Ci[0]; // -x 
+    Ji[5] = 0;
+    Ji[6] = Xj_Ci[2]; // z
+ 
+    apply_Sim3_adj_inv(ti, qi, si, Ji, Jj);
+    for (int n=0; n<7; n++) Ji[n] = -Jj[n];
+
+    l=0;
+    for (int n=0; n<14; n++) {
+      for (int m=0; m<=n; m++) {
+        hij[l] += w[2] * Jx[n] * Jx[m];
+        l++;
+      }
+    }
+ 
+    for (int n=0; n<7; n++) {
+      vi[n] += w[2] * err[2] * Ji[n];
+      vj[n] += w[2] * err[2] * Jj[n];
+    }
+ 
+ 
+  }
+ 
+  __syncthreads();
+ 
+  __shared__ float sdata[THREADS];
+  for (int n=0; n<7; n++) {
+    sdata[threadIdx.x] = vi[n];
+    blockReduce(sdata);
+    if (threadIdx.x == 0) {
+      gs[0][block_id][n] = sdata[0];
+    }
+ 
+    __syncthreads();
+ 
+    sdata[threadIdx.x] = vj[n];
+    blockReduce(sdata);
+    if (threadIdx.x == 0) {
+      gs[1][block_id][n] = sdata[0];
+    }
+ 
+  }
+ 
+  l=0;
+  for (int n=0; n<14; n++) {
+    for (int m=0; m<=n; m++) {
+      sdata[threadIdx.x] = hij[l];
+      blockReduce(sdata);
+ 
+      if (threadIdx.x == 0) {
+        if (n<7 && m<7) {
+          Hs[0][block_id][n][m] = sdata[0];
+          Hs[0][block_id][m][n] = sdata[0];
+        }
+        else if (n >=7 && m<7) {
+          Hs[1][block_id][m][n-7] = sdata[0];
+          Hs[2][block_id][n-7][m] = sdata[0];
+        }
+        else {
+          Hs[3][block_id][n-7][m-7] = sdata[0];
+          Hs[3][block_id][m-7][n-7] = sdata[0];
+        }
+      }
+ 
+      l++;
+    }
+  }
+}
+
+std::vector<torch::Tensor> gauss_newton_points_cuda(
+  torch::Tensor Twc, torch::Tensor Xs, torch::Tensor Cs,
+  torch::Tensor ii, torch::Tensor jj, 
+  torch::Tensor idx_ii2jj, torch::Tensor valid_match,
+  torch::Tensor Q,
+  const float sigma_point,
+  const float C_thresh,
+  const float Q_thresh,
+  const int max_iter,
+  const float delta_thresh)
+{
+  auto opts = Twc.options();
+  const int num_edges = ii.size(0);
+  const int num_poses = Xs.size(0);
+  const int n = Xs.size(1);
+
+  // TODO: make this a parameter
+  const int num_fix = 1;
+
+  // Setup indexing
+  torch::Tensor unique_kf_idx = get_unique_kf_idx(ii, jj);
+  // For edge construction
+  std::vector<torch::Tensor> inds = create_inds(unique_kf_idx, 0, ii, jj);
+  torch::Tensor ii_edge = inds[0];
+  torch::Tensor jj_edge = inds[1];
+  // For linear system indexing (pin=2 because fixing first two poses)
+  std::vector<torch::Tensor> inds_opt = create_inds(unique_kf_idx, num_fix, ii, jj);
+  torch::Tensor ii_opt = inds_opt[0];
+  torch::Tensor jj_opt = inds_opt[1];
+
+  const int pose_dim = 7; // sim3
+
+  // initialize buffers
+  torch::Tensor Hs = torch::zeros({4, num_edges, pose_dim, pose_dim}, opts);
+  torch::Tensor gs = torch::zeros({2, num_edges, pose_dim}, opts);
+
+  // For debugging outputs
+  torch::Tensor dx;
+
+  torch::Tensor delta_norm;
+
+  for (int itr=0; itr<max_iter; itr++) {
+
+    point_align_kernel<<<num_edges, THREADS>>>(
+      Twc.packed_accessor32<float,2,torch::RestrictPtrTraits>(),
+      Xs.packed_accessor32<float,3,torch::RestrictPtrTraits>(),
+      Cs.packed_accessor32<float,3,torch::RestrictPtrTraits>(),
+      ii_edge.packed_accessor32<long,1,torch::RestrictPtrTraits>(),
+      jj_edge.packed_accessor32<long,1,torch::RestrictPtrTraits>(),
+      idx_ii2jj.packed_accessor32<long,2,torch::RestrictPtrTraits>(),
+      valid_match.packed_accessor32<bool,3,torch::RestrictPtrTraits>(),
+      Q.packed_accessor32<float,3,torch::RestrictPtrTraits>(),
+      Hs.packed_accessor32<float,4,torch::RestrictPtrTraits>(),
+      gs.packed_accessor32<float,3,torch::RestrictPtrTraits>(),
+      sigma_point, C_thresh, Q_thresh
+    );
+
+
+    // pose x pose block
+    SparseBlock A(num_poses - num_fix, pose_dim);
+
+    A.update_lhs(Hs.reshape({-1, pose_dim, pose_dim}), 
+        torch::cat({ii_opt, ii_opt, jj_opt, jj_opt}), 
+        torch::cat({ii_opt, jj_opt, ii_opt, jj_opt}));
+
+    A.update_rhs(gs.reshape({-1, pose_dim}), 
+        torch::cat({ii_opt, jj_opt}));
+
+    // NOTE: Accounting for negative here!
+    dx = -A.solve();
+    
+    pose_retr_kernel<<<1, THREADS>>>(
+      Twc.packed_accessor32<float,2,torch::RestrictPtrTraits>(),
+      dx.packed_accessor32<float,2,torch::RestrictPtrTraits>(),
+      num_fix);
+
+    // Termination criteria
+    // Need to specify this second argument otherwise ambiguous function call...
+    delta_norm = torch::linalg::norm(dx, std::optional<c10::Scalar>(), {}, false, {});
+    if (delta_norm.item<float>() < delta_thresh) {
+      break;
+    }
+        
+
+  }
+
+  return {dx}; // For debugging
+}
 
 __global__ void calib_proj_kernel(
     const torch::PackedTensorAccessor32<float,2,torch::RestrictPtrTraits> Twc,

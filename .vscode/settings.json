@@ -38,6 +38,7 @@
         "__threading_support": "cpp",
         "__verbose_abort": "cpp",
         "locale": "cpp",
-        "complex": "cpp"
+        "complex": "cpp",
+        "nnls": "cpp"
     }
 }

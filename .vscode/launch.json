@@ -15,7 +15,7 @@
             "python": "/home/jiaming/Projects/frodobot/ms/.venv/bin/python",
             "args": [
                 "--dataset",
-                "data/filtered_8k_1/ride_53663_1f6131_20240604235653/img/",
+                "data/filtered_8k_1/ride_53663_1f6131_20240604235653/",
             ],
             "env": { 
                 "CUDA_LAUNCH_BLOCKING": "1"

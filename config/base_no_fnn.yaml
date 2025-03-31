@@ -1,5 +1,6 @@
 use_calib: False
 single_thread: False
+image_size: [288, 512] # [h, w]
 dataset:
   subsample: 1
   img_downsample: 1
@@ -37,11 +38,11 @@ tracking:
   new_map_after_loss_track_N: 3
   
 local_opt:
+  min_match_frac: 0.001 # minimum match fraction for local mapping optimization
   pin: 1
   window_size: 1e+6   
   C_conf: 0.0
   Q_conf: 1.5
-  min_match_frac: 0.1
   pixel_border: -10 # Only in calib (negative means allow pixels outside image up to that distance)
   depth_eps: 1e-6 # Only in calib case
   max_iters: 10

@@ -39,6 +39,7 @@ std::vector<torch::Tensor> gauss_newton_rays_cuda(
   const float sigma_dist,
   const float C_thresh,
   const float Q_thresh,
+  const int num_fix,
   const int max_iter,
   const float delta_thresh);
 
@@ -51,6 +52,7 @@ std::vector<torch::Tensor> gauss_newton_rays(
   const float sigma_dist,
   const float C_thresh,
   const float Q_thresh,
+  const int num_fix,
   const int max_iter,
   const float delta_thresh);
 

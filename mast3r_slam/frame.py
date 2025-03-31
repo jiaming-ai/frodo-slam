@@ -220,10 +220,11 @@ class SharedStates:
 class SharedKeyframes:
     def __init__(self, manager, h, w, buffer=200, dtype=torch.float32, device="cuda"):
         self.lock = manager.RLock()
-        self.n_size = manager.Value("i", 0)
+        # self.n_size = manager.Value("i", 0)
+        self._idx = manager.Value("i", -1)
 
         self.h, self.w = h, w
-        self.buffer = buffer
+        self.buffer_size = buffer
         self.dtype = dtype
         self.device = device  # Store the target device for when we return frames
 
@@ -251,7 +252,7 @@ class SharedKeyframes:
     def get_frame_cpu(self, idx) -> Frame:
         with self.lock:
             # Wrap the index if needed
-            idx = idx % self.buffer
+            idx = idx % self.buffer_size
             # Move data to the target device when returning a frame
             kf = Frame(
                 int(self.dataset_idx[idx]),
@@ -274,7 +275,7 @@ class SharedKeyframes:
     def __getitem__(self, idx) -> Frame:
         with self.lock:
             # Wrap the index if needed
-            idx = idx % self.buffer
+            idx = idx % self.buffer_size
             # Move data to the target device when returning a frame
             kf = Frame(
                 int(self.dataset_idx[idx]),
@@ -296,15 +297,9 @@ class SharedKeyframes:
 
     def __setitem__(self, idx, value: Frame) -> None:
         with self.lock:
-            if idx >= self.buffer:
-                # Calculate the index to use within the buffer
-                idx = idx % self.buffer
-                # We're overwriting an existing frame, so we don't need to increment n_size
-                # If we've filled the buffer, n_size should remain at buffer size
-                self.n_size.value = min(self.buffer, self.n_size.value)
-            else:
-                # Normal case - update n_size if needed
-                self.n_size.value = max(idx + 1, self.n_size.value)
+            assert idx <= self._idx.value + 1
+            self._idx.value = idx if idx > self._idx.value else self._idx.value
+            idx = idx % self.buffer_size
 
             # Move data to CPU before storing
             self.dataset_idx[idx] = value.frame_id
@@ -325,30 +320,32 @@ class SharedKeyframes:
     def __len__(self):
         with self.lock:
             # Return the actual number of frames, capped by buffer size
-            return min(self.n_size.value, self.buffer)
+            return min(self._idx.value + 1, self.buffer_size)
 
     def to_cpu(self):
         # Update device attribute
         self.device = "cpu"
 
+
     def append(self, value: Frame):
         with self.lock:
-            self[self.n_size.value] = value
+            self[self._idx.value + 1] = value
+        return self._idx.value
 
     def pop_last(self):
         with self.lock:
-            self.n_size.value -= 1
+            self._idx.value -= 1
 
     def last_keyframe(self) -> Optional[Frame]:
         with self.lock:
-            if self.n_size.value == 0:
+            if self._idx.value == -1:
                 return None
-            return self[self.n_size.value - 1]
+            return self[self._idx.value]
 
     def update_T_WCs(self, T_WCs, idx) -> None:
         with self.lock:
             # Wrap the index if needed
-            idx = idx % self.buffer if isinstance(idx, int) else idx % self.buffer
+            idx = idx % self.buffer_size
             self.T_WC[idx] = T_WCs.data.cpu()
 
     def get_dirty_idx(self):
@@ -358,11 +355,173 @@ class SharedKeyframes:
             return idx
 
     def set_intrinsics(self, K):
-        assert config["use_calib"]
         with self.lock:
-            self.K[:] = K.cpu()
+            assert config["use_calib"]
+            self.K[:] = K
 
     def get_intrinsics(self):
         assert config["use_calib"]
         with self.lock:
-            return self.K.to(device=self.device)
+            return self.K
+    
+    
+    
+    # def append(self, value: Frame):
+    #     with self.lock:
+    #         self[self._idx.value] = value
+
+    # def pop_last(self):
+    #     with self.lock:
+    #         self._idx.value -= 1
+
+    # def last_keyframe(self) -> Optional[Frame]:
+    #     with self.lock:
+    #         if self.n_size.value == 0:
+    #             return None
+    #         return self[self.n_size.value - 1]
+
+    # def update_T_WCs(self, T_WCs, idx) -> None:
+    #     with self.lock:
+    #         # Wrap the index if needed
+    #         idx = idx % self.buffer_size if isinstance(idx, int) else idx % self.buffer_size
+    #         self.T_WC[idx] = T_WCs.data.cpu()
+
+    # def get_dirty_idx(self):
+    #     with self.lock:
+    #         idx = torch.where(self.is_dirty)[0]
+    #         self.is_dirty[:] = False
+    #         return idx
+
+    # def set_intrinsics(self, K):
+    #     assert config["use_calib"]
+    #     with self.lock:
+    #         self.K[:] = K.cpu()
+
+    # def get_intrinsics(self):
+    #     assert config["use_calib"]
+    #     with self.lock:
+    #         return self.K.to(device=self.device)
+
+
+
+class KeyframesCuda:
+    def __init__(self, h, w, buffer=200, dtype=torch.float32, device="cuda"):
+        self.idx = -1
+
+        self.h, self.w = h, w
+        self.buffer_size = buffer
+        self.dtype = dtype
+        self.device = device  # Store the target device for when we return frames
+
+        self.feat_dim = 1024
+        self.num_patches = h * w // (16 * 16)
+
+        # fmt:off
+        # Store everything in CPU memory instead of device
+        self.dataset_idx = torch.zeros(buffer, dtype=torch.int, device=device)
+        self.img = torch.zeros(buffer, 3, h, w, dtype=dtype, device=device)
+        self.uimg = torch.zeros(buffer, h, w, 3, dtype=dtype, device=device)
+        self.img_shape = torch.zeros(buffer, 1, 2, dtype=torch.int, device=device)
+        self.img_true_shape = torch.zeros(buffer, 1, 2, dtype=torch.int, device=device)
+        self.T_WC = torch.zeros(buffer, 1, lietorch.Sim3.embedded_dim, dtype=dtype, device=device)
+        self.X = torch.zeros(buffer, h * w, 3, dtype=dtype, device=device)
+        self.C = torch.zeros(buffer, h * w, 1, dtype=dtype, device=device)
+        self.N = torch.zeros(buffer, dtype=torch.int, device=device)
+        self.N_updates = torch.zeros(buffer, dtype=torch.int, device=device)
+        self.feat = torch.zeros(buffer, 1, self.num_patches, self.feat_dim, dtype=dtype, device=device)
+        self.pos = torch.zeros(buffer, 1, self.num_patches, 2, dtype=torch.long, device=device)
+        self.is_dirty = torch.zeros(buffer, 1, dtype=torch.bool, device=device)
+        self.K = torch.zeros(3, 3, dtype=dtype, device=device)
+        # fmt: on
+
+    def reset(self):
+        self.idx = -1
+
+    def __getitem__(self, idx) -> Frame:
+        # NOTE: this is unsafe, idx is not checked. it can points to non-existing frames.
+
+            # Wrap the index if needed
+        idx = idx % self.buffer_size
+        # Move data to the target device when returning a frame
+        kf = Frame(
+            int(self.dataset_idx[idx]),
+            self.img[idx],
+            self.img_shape[idx],
+            self.img_true_shape[idx],
+            self.uimg[idx],  # uimg stays on CPU
+            lietorch.Sim3(self.T_WC[idx]),
+        )
+        kf.X_canon = self.X[idx]
+        kf.C = self.C[idx]
+        kf.feat = self.feat[idx]
+        kf.pos = self.pos[idx]
+        kf.N = int(self.N[idx])
+        kf.N_updates = int(self.N_updates[idx])
+        if config["use_calib"]:
+            kf.K = self.K
+        return kf
+
+    def __setitem__(self, idx, value: Frame) -> None:
+        # NOTE: we assume sequential insertion only, idx is not checked.
+        # self.idx is always points to the last data in the buffer
+
+        assert idx <= self.idx + 1
+        self.idx = self.idx + 1 if idx > self.idx else self.idx
+        idx = idx % self.buffer_size
+
+        # if idx >= self.buffer_size:
+        #     # Calculate the index to use within the buffer
+        #     idx = idx % self.buffer_size
+        #     # We're overwriting an existing frame, so we don't need to increment n_size
+        #     # If we've filled the buffer, n_size should remain at buffer size
+        #     self.n_size = min(self.buffer_size, self.n_size)
+        # else:
+        #     # Normal case - update n_size if needed
+        #     self.n_size = max(idx + 1, self.n_size)
+
+        self.dataset_idx[idx] = value.frame_id
+        self.img[idx] = value.img
+        self.uimg[idx] = value.uimg
+        self.img_shape[idx] = value.img_shape
+        self.img_true_shape[idx] = value.img_true_shape
+        self.T_WC[idx] = value.T_WC.data
+        self.X[idx] = value.X_canon
+        self.C[idx] = value.C
+        self.feat[idx] = value.feat
+        self.pos[idx] = value.pos
+        self.N[idx] = value.N
+        self.N_updates[idx] = value.N_updates
+        self.is_dirty[idx] = True
+        return idx
+
+    def __len__(self):
+        return min(self.idx + 1, self.buffer_size)
+
+    def append(self, value: Frame):
+        self[self.idx + 1] = value
+        return self.idx
+    def pop_last(self):
+        self.idx -= 1
+
+    def last_keyframe(self) -> Optional[Frame]:
+        if self.idx == -1:
+            return None
+        return self[self.idx]
+
+    def update_T_WCs(self, T_WCs, idx) -> None:
+        # Wrap the index if needed
+        idx = idx % self.buffer_size
+        self.T_WC[idx] = T_WCs.data
+
+    def get_dirty_idx(self):
+        idx = torch.where(self.is_dirty)[0]
+        self.is_dirty[:] = False
+        return idx
+
+    def set_intrinsics(self, K):
+        assert config["use_calib"]
+        self.K[:] = K
+
+    def get_intrinsics(self):
+        assert config["use_calib"]
+        return self.K

@@ -194,6 +194,27 @@ def mast3r_inference_mono(model, frame):
 
 
 def mast3r_match_symmetric(model, feat_i, pos_i, feat_j, pos_j, shape_i, shape_j):
+    """Match two frames symmetrically
+
+    Args:
+        model (AsymmetricMASt3R): MASt3R model
+        feat_i (torch.Tensor): Feature of frame i
+        pos_i (torch.Tensor): Position of frame i
+        feat_j (torch.Tensor): Feature of frame j
+        pos_j (torch.Tensor): Position of frame j
+        shape_i (torch.Tensor): Shape of frames i, 1 x 2
+        shape_j (torch.Tensor): Shape of frames j, 1 x 2
+
+    Returns:
+        idx_i2j (torch.Tensor): Index of frame i to frame j
+        idx_j2i (torch.Tensor): Index of frame j to frame i
+        valid_match_j (torch.Tensor): Valid match of frame j
+        valid_match_i (torch.Tensor): Valid match of frame i
+        Qii (torch.Tensor): Quality of frame i to frame j
+        Qjj (torch.Tensor): Quality of frame j to frame i
+        Qji (torch.Tensor): Quality of frame j to frame i
+        Qij (torch.Tensor): Quality of frame i to frame j
+    """
     X, C, D, Q = mast3r_decode_symmetric_batch(
         model, feat_i, pos_i, feat_j, pos_j, shape_i, shape_j
     )

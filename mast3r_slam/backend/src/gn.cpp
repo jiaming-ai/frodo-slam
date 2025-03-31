@@ -34,6 +34,7 @@ std::vector<torch::Tensor> gauss_newton_rays(
   const float sigma_dist,
   const float C_thresh,
   const float Q_thresh,
+  const int num_fix,
   const int max_iter,
   const float delta_thresh) {
 
@@ -48,7 +49,7 @@ std::vector<torch::Tensor> gauss_newton_rays(
 
   // const at::cuda::OptionalCUDAGuard device_guard(device_of(x1));
   return gauss_newton_rays_cuda(Twc, Xs, Cs, ii, jj, idx_ii2jj, valid_match, Q,
-      sigma_ray, sigma_dist, C_thresh, Q_thresh, max_iter, delta_thresh);
+      sigma_ray, sigma_dist, C_thresh, Q_thresh, num_fix, max_iter, delta_thresh);
 }
 
 std::vector<torch::Tensor> gauss_newton_calib(

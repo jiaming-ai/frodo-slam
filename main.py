@@ -1,6 +1,8 @@
 import argparse
 import datetime
+import os
 import pathlib
+import pickle
 import sys
 import time
 import cv2
@@ -162,9 +164,12 @@ def main(args):
     main2viz = new_queue(manager, args.no_viz)
     viz2main = new_queue(manager, args.no_viz)
 
-    dataset = load_dataset(args.dataset)
+    dataset = load_dataset(os.path.join(args.dataset, "img"))
     dataset.subsample(config["dataset"]["subsample"])
     h, w = dataset.get_img_shape()[0]
+
+    # load odometry data
+    odom = pickle.load(open(os.path.join(args.dataset, "traj_data.pkl"), "rb"))
 
     if args.calib:
         with open(args.calib, "r") as f:

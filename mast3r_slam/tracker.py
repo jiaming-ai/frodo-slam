@@ -7,6 +7,7 @@ from mast3r_slam.geometry import (
     constrain_points_to_ray,
     project_calib,
 )
+from mast3r_slam.local_mapping import FactorGraph
 from mast3r_slam.nonlinear_optimizer import check_convergence, huber
 from mast3r_slam.config import config
 from mast3r_slam.mast3r_utils import (
@@ -18,55 +19,88 @@ from mast3r.fast_nn import fast_reciprocal_NNs
 from mast3r_slam.visualization_utils import visualize_matches
 import matplotlib.pyplot as plt
 from mast3r_slam.matching import pixel_to_lin, lin_to_pixel
-from mast3r_slam.frame import Mode
+from mast3r_slam.frame import Mode, KeyframesCuda
 
-class FrameBuffer:
-    def __init__(self, window_size=8, offset_to_current=[-2,-4]):
-        assert -min(offset_to_current) < window_size,\
+class LocalMapOptimizer:
+    def __init__(self, 
+                 model,
+                 buffer_size=6, 
+                 offset_to_current=[-1,-3],
+                 device="cuda"):
+        assert -min(offset_to_current) < buffer_size,\
             "Window size must be less than the minimum edge"
 
-        self.encoder_buffer = [None] * window_size
-        self.buffer_size = window_size
+        self.device = device
+        self.cfg = config
+        self.frames_buffer = KeyframesCuda(
+            config["image_size"][0],
+            config["image_size"][1],
+            buffer=buffer_size,
+            device=device
+        )
+        self.img_shape = config["image_size"]
+        self.buffer_size = buffer_size
         self.offset_to_current = offset_to_current
         self._idx = -1
-        self.pairs = []
+        self.cache_to_frame_id= {}
+        self.graph = FactorGraph(model, self.frames_buffer, device=self.device)
 
-    def add_encoder_result(self, frame):
-        """Add a frame to the buffer
-        Args:
-            frame (Frame): (feat, pos)
-            n (int): frame id. 
-        """
+        self.enabled = False
+
+    def add_frame(self, frame, idx):
+        if not self.enabled:
+            return
         self._idx += 1
-        self.encoder_buffer[self._idx % self.buffer_size] = (frame.feat, frame.pos)
+        # when new frame is added, some previous factors are invalid
+        if self._idx >= self.buffer_size:
+            # when idx is wrapped around, remove the factors that contain the old frame
+            self.graph.remove_factors_i(self._idx % self.buffer_size)
 
-    def prepare_decoder_inputs(self):
-        """Get the encoder feature for a given frame id
-        Assumes the buffer is full
-        """
-        if self._idx < self.buffer_size:
-            return None, None, None, None
-        idxs_i = [(self._idx + offset) % self.buffer_size for offset in self.offset_to_current]
-        idxs_j = [self._idx % self.buffer_size] * len(self.offset_to_current)
-        frames_i = [self.encoder_buffer[idx] for idx in idxs_i]
-        frames_j = [self.encoder_buffer[idx] for idx in idxs_j]
+        # map the idx to the frame id
+        cache_idx = self.frames_buffer.append(frame)
+        self.cache_to_frame_id[cache_idx] = idx
 
-        feats_i = torch.cat([frame[0] for frame in frames_i], dim=0)
-        feats_j = torch.cat([frame[0] for frame in frames_j], dim=0)
-        pos_i = torch.cat([frame[1] for frame in frames_i], dim=0)
-        pos_j = torch.cat([frame[1] for frame in frames_j], dim=0)
-        return feats_i, pos_i, feats_j, pos_j
+        self.add_factors()
+
+
+    def optimize(self, init=False):
+        if len(self.graph.factors) < 19:
+            return None, None
+        return self.graph.solve_GN_rays(init)
+
+
+    # def prepare_decoder_inputs(self):
+    #     """Get the encoder feature for a given frame id
+    #     Assumes the buffer is full
+    #     """
+    #     if self._idx < self.buffer_size:
+    #         return None, None, None, None, None, None
+    #     idxs_i = [(self._idx + offset) % self.buffer_size for offset in self.offset_to_current]
+    #     idxs_j = [self._idx % self.buffer_size] * len(self.offset_to_current)
+    #     frames_i = [self.encoder_buffer[idx] for idx in idxs_i]
+    #     frames_j = [self.encoder_buffer[idx] for idx in idxs_j]
+
+    #     feats_i = torch.cat([frame[0] for frame in frames_i], dim=0)
+    #     feats_j = torch.cat([frame[0] for frame in frames_j], dim=0)
+    #     pos_i = torch.cat([frame[1] for frame in frames_i], dim=0)
+    #     pos_j = torch.cat([frame[1] for frame in frames_j], dim=0)
+    #     return feats_i, pos_i, feats_j, pos_j, idxs_i, idxs_j
     
-    def add_decoder_results(self, frames):
-        """Add a frame to the buffer
-        Args:
-            frames (list): list of frames
-        """
-        pass
     def reset(self):
-        self.encoder_buffer = [None] * self.buffer_size
+        self.frames_buffer.reset() 
         self._idx = -1
+        self.graph.reset()
+        self.cache_to_frame_id = {}
 
+    def add_factors(self):
+        """Add factors to the graph"""
+        idxs_i = [(self._idx + offset) for offset in self.offset_to_current]
+        idxs_i = [i % self.buffer_size for i in idxs_i if i >= 0]
+        idxs_j = [self._idx % self.buffer_size] * len(idxs_i)
+        if len(idxs_i) == 0:
+            return
+        self.graph.add_factors(idxs_i, idxs_j)
+        
 class FrameTracker:
     def __init__(self, model, frames, device, states):
         self.cfg = config["tracking"]
@@ -80,15 +114,18 @@ class FrameTracker:
         self.reset_idx_f2k()
 
 
-        self._offset_to_current = [-2,-4]
-        self._local_window_size = 6
+        # self._offset_to_current = [-1, -3, -5]
+        # self._local_window_size = 20
 
-        # n key frame
-        self._n = 0
-        self._mode = "init"
-        # the relative id from the current keyframe
-        self._buffer = FrameBuffer(window_size=self._local_window_size, 
-                                   offset_to_current=self._offset_to_current)
+        # # n key frame
+        # self._mode = Mode.INIT
+        # # the relative id from the current keyframe
+        # self.local_opt = LocalMapOptimizer(
+        #     model=self.model,
+        #     buffer_size=self._local_window_size, 
+        #     offset_to_current=self._offset_to_current,
+        #     device=self.device
+        # )
     
     def reset(self, keyframes):
         """Reset the tracker
@@ -97,10 +134,10 @@ class FrameTracker:
         # assumes the keyframes contains the first keyframe
         self.keyframes = keyframes
         self.reset_idx_f2k()
-        self._n = 0
-        self._mode = "init"
-        self._buffer.reset()
         self.last_kf = None
+
+        # self._mode = Mode.INIT
+        # self.local_opt.reset()
 
     # Initialize with identity indexing of size (1,n)
     def reset_idx_f2k(self):
@@ -117,13 +154,14 @@ class FrameTracker:
             frame.update_pointmap(X_init, C_init)
 
             # only add encoder result if it's not been added yet
-            self._buffer.add_encoder_result(frame)
+            # self.local_opt.add_frame(frame, 0)
 
         self.keyframes.append(frame)
         self.states.set_mode(Mode.TRACKING)
         self.states.set_frame(frame)
         self.last_kf = frame
         self.img_shape = frame.img_true_shape
+
 
 
     def track(self, frame: Frame) -> tuple[list, bool]:
@@ -294,32 +332,20 @@ class FrameTracker:
 
             # set the current frame as the last keyframe
             self.last_kf = frame
-            self.keyframes.append(frame)
+            idx = self.keyframes.append(frame)
 
             # perform local optimization if a new keyframe is created
-            self._buffer.add_encoder_result(frame)
-            # prepare decoder inputs
-            feats_i, pos_i, feats_j, pos_j = self._buffer.prepare_decoder_inputs()
-            if feats_i is not None:
-                n_frames = len(self._offset_to_current)
-                (
-                    idx_i2j,
-                    idx_j2i,
-                    valid_match_j,
-                    valid_match_i,
-                    Qii,
-                    Qjj,
-                    Qji,
-                    Qij,
-                ) = mast3r_match_symmetric(
-                    self.model, 
-                    feats_i, 
-                    pos_i, 
-                    feats_j, 
-                    pos_j, 
-                    self.img_shape, 
-                    self.img_shape
-                )
+            # self.local_opt.add_frame(frame, idx)
+
+            # T_WCs, unique_kf_idx_cache = self.local_opt.optimize(self._mode == Mode.INIT)
+            # if T_WCs is not None:
+            #     unique_kf_idx_cache = unique_kf_idx_cache.tolist()
+            #     unique_kf_idx = [self.local_opt.cache_to_frame_id[idx] for idx in unique_kf_idx_cache]
+
+            #     self.keyframes.update_T_WCs(T_WCs, torch.tensor(unique_kf_idx))
+            #     print(f"Local optimization done for frame {frame.frame_id}")
+            #     if self._mode == Mode.INIT:
+            #         self._mode = Mode.TRACKING
 
         return (
             [

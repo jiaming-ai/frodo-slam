@@ -155,6 +155,7 @@ class FactorGraph:
         )
 
         # Update the keyframe T_WC
+        # TODO how to update the updated poses?
         self.frames.update_T_WCs(T_WCs[pin:], unique_kf_idx[pin:])
 
     def solve_GN_calib(self):

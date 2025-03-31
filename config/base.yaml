@@ -1,5 +1,6 @@
 use_calib: False
 single_thread: False
+image_size: [288, 512] # [h, w]
 dataset:
   subsample: 1
   img_downsample: 1
@@ -37,6 +38,7 @@ tracking:
   new_map_after_loss_track_N: 3
   
 local_opt:
+  min_match_frac: 0.002 # minimum match fraction for local mapping optimization
   pin: 1
   window_size: 1e+6   
   C_conf: 0.0
