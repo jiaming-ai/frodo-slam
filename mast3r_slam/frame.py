@@ -30,7 +30,54 @@ class Frame:
     N_updates: int = 0
     K: Optional[torch.Tensor] = None
     odom: Optional[torch.Tensor] = None
+    X_traversability: Optional[torch.Tensor] = None
 
+    def fit_ground_plane(self):
+        """
+        fit a ground plane to the pointcloud
+        return the plane equation in the camera frame
+        most of the time the norm is (0,+-1,0) as y is vertical
+        so the plane equation is z = d
+        use RANSAC
+        1. sample 3 points from traversible pointcloud (or X_canon if no traversible pointcloud)
+        2. solve the plane equation from the 3 points
+        3. project other traversible points to the normal vector, get the distance to the plane
+        4. count the number of points that are within a certain threshold ds < threshold
+        5. repeat above for N times, and select the plane with the highest inlier ratio
+        """
+        # TODO: implement this
+        pass
+    
+    def pred_metric_scale(self):
+        """
+        First fit a ground plane to the pointcloud.
+        Then use the known height of the camera (0.5xxm) h to compute the ratio s' = abs(h/ds) from the plane equation
+        Note the s, which is the current scale T_wc.data[...,7]
+        Then update the T_wc:
+        T_wc.translation = T_wc.translation * s'
+        T_wc.scale = T_wc.scale * s'
+
+        """
+        # TODO: implement this
+        pass
+
+    def pred_traversability(self):
+        """
+        pred the traversability of the pointcloud
+        For each point, pred the traversability score (logit), or use sigmoid to get probability (0-1)
+        """
+        # TODO: implement this
+        # self.X_traversability = 
+        
+    def get_pointcloud_world(self):
+        """return the pointcloud in the world frame
+        """
+        # TODO: implement this
+        # return self.X_canon @ self.T_WC.matrix().T
+        pass
+
+    
+    
     def get_score(self, C):
         filtering_score = config["tracking"]["filtering_score"]
         if filtering_score == "median":

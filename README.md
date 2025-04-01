@@ -53,6 +53,8 @@ pip install -e thirdparty/in3d
 pip install --no-build-isolation -e .
  
 
+# install flash attention
+
 # Optionally install torchcodec for faster mp4 loading
 pip install torchcodec==0.1
 ```
