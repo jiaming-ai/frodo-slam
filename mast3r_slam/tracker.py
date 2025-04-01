@@ -344,7 +344,7 @@ class FrameTracker:
 
             self.local_opt.last_frame_is_keyframe(idx)
 
-            print(f"before optimize: {frame.T_WC.data[0]}")
+            # print(f"before optimize: {frame.T_WC.data[0]}")
             success = self.local_opt.optimize()
             if success:
                 kf_poses, kf_idx = self.local_opt.get_kf_poses()
@@ -352,7 +352,7 @@ class FrameTracker:
 
                 # update the last keyframe pose
                 self.last_kf.T_WC.data = kf_poses[kf_idx == idx][0].to(self.device)
-                print(f"after optimize: {frame.T_WC.data[0]}")
+                # print(f"after optimize: {frame.T_WC.data[0]}")
 
 
 
