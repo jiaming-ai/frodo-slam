@@ -27,9 +27,15 @@ class OdomResidualScaleOnly(nn.Module):
     def __init__(self, Twc):
         super().__init__()
      
-        self.scale = nn.Parameter(torch.ones(Twc.shape[0]-1,1))
+        # self.scale = nn.Parameter(torch.ones(Twc.shape[0]-1,1))
+        self._scale = nn.Parameter(torch.ones(1,1))
+        # self.scale = self._scale.expand(Twc.shape[0]-1, 1)
         self.Twc = Twc
         self.current_delta_T = self.Twc[:-1].Inv() * self.Twc[1:]
+
+    @property
+    def scale(self):
+        return self._scale.expand(self.Twc.shape[0]-1, 1)
 
     def forward(self, Twc_prior_inv, Todom_inv, prior_weight=None, odom_weight=None, lcs=None):
         """
