@@ -169,6 +169,77 @@ def create_frame(i, img, T_WC, img_size=512, device="cuda:0", odom=None):
     frame = Frame(i, rgb, img_shape, img_true_shape, uimg, T_WC, odom=odom)
     return frame
 
+class StatesCuda:
+    def __init__(self, h, w, dtype=torch.float32, device="cuda"):
+        self.h, self.w = h, w
+        self.dtype = dtype
+        self.device = device
+
+        self.paused = 0
+        self.mode = Mode.INIT
+
+        self.feat_dim = 1024
+        self.num_patches = h * w // (16 * 16)
+
+        # fmt:off
+        # shared state for the current frame (used for reloc/visualization)
+        self.dataset_idx = torch.zeros(1, device=device, dtype=torch.int)
+        self.img = torch.zeros(3, h, w, device=device, dtype=dtype)
+        self.uimg = torch.zeros(h, w, 3, device="cpu", dtype=dtype)
+        self.img_shape = torch.zeros(1, 2, device=device, dtype=torch.int)
+        self.img_true_shape = torch.zeros(1, 2, device=device, dtype=torch.int)
+        self.T_WC = lietorch.Sim3.Identity(1, device=device, dtype=dtype).data
+        self.X = torch.zeros(h * w, 3, device=device, dtype=dtype)
+        self.C = torch.zeros(h * w, 1, device=device, dtype=dtype)
+        self.feat = torch.zeros(1, self.num_patches, self.feat_dim, device=device, dtype=dtype)
+        self.pos = torch.zeros(1, self.num_patches, 2, device=device, dtype=torch.long)
+        # fmt: on
+
+
+    def set_frame(self, frame):
+        self.dataset_idx[:] = frame.frame_id
+        self.img[:] = frame.img
+        self.uimg[:] = frame.uimg
+        self.img_shape[:] = frame.img_shape
+        self.img_true_shape[:] = frame.img_true_shape
+        self.T_WC[:] = frame.T_WC.data
+        self.X[:] = frame.X_canon
+        self.C[:] = frame.C
+        self.feat[:] = frame.feat
+        self.pos[:] = frame.pos
+
+    def get_pose(self):
+        return lietorch.Sim3(self.T_WC)
+
+    def get_frame(self):
+        frame = Frame(
+            int(self.dataset_idx[0]),
+            self.img,
+            self.img_shape,
+            self.img_true_shape,
+            self.uimg,
+            lietorch.Sim3(self.T_WC),
+        )
+        frame.X_canon = self.X
+        frame.C = self.C
+        frame.feat = self.feat
+        frame.pos = self.pos
+        return frame
+
+    def get_mode(self):
+        return self.mode
+
+    def set_mode(self, mode):
+        self.mode = mode
+
+    def pause(self):
+        self.paused = 1
+
+    def unpause(self):
+        self.paused = 0
+
+    def is_paused(self):
+        return self.paused == 1
 
 class SharedStates:
     def __init__(self, manager, h, w, dtype=torch.float32, device="cuda"):
@@ -200,6 +271,15 @@ class SharedStates:
         self.feat = torch.zeros(1, self.num_patches, self.feat_dim, device=device, dtype=dtype).share_memory_()
         self.pos = torch.zeros(1, self.num_patches, 2, device=device, dtype=torch.long).share_memory_()
         # fmt: on
+    def get_pose(self):
+        return lietorch.Sim3(self.T_WC)
+    
+    def reset(self):
+        with self.lock:
+            self.reloc_sem.value = 0
+            self.global_optimizer_tasks[:] = []
+            self.edges_ii[:] = []
+            self.edges_jj[:] = []
 
     def set_frame(self, frame):
         with self.lock:
@@ -266,7 +346,7 @@ class SharedStates:
 
 
 class SharedKeyframes:
-    def __init__(self, manager, h, w, buffer=200, dtype=torch.float32, device="cuda"):
+    def __init__(self, manager, h, w, buffer=300, dtype=torch.float32, device="cuda"):
         self.lock = manager.RLock()
         # self.n_size = manager.Value("i", 0)
         self._idx = manager.Value("i", -1)
@@ -370,6 +450,11 @@ class SharedKeyframes:
             # Return the actual number of frames, capped by buffer size
             return min(self._idx.value + 1, self.buffer_size)
 
+    def reset(self):
+        with self.lock:
+            self._idx.value = -1
+            self.is_dirty[:] = False
+
     def to_cpu(self):
         # Update device attribute
         self.device = "cpu"
@@ -413,45 +498,6 @@ class SharedKeyframes:
             return self.K
     
     
-    
-    # def append(self, value: Frame):
-    #     with self.lock:
-    #         self[self._idx.value] = value
-
-    # def pop_last(self):
-    #     with self.lock:
-    #         self._idx.value -= 1
-
-    # def last_keyframe(self) -> Optional[Frame]:
-    #     with self.lock:
-    #         if self.n_size.value == 0:
-    #             return None
-    #         return self[self.n_size.value - 1]
-
-    # def update_T_WCs(self, T_WCs, idx) -> None:
-    #     with self.lock:
-    #         # Wrap the index if needed
-    #         idx = idx % self.buffer_size if isinstance(idx, int) else idx % self.buffer_size
-    #         self.T_WC[idx] = T_WCs.data.cpu()
-
-    # def get_dirty_idx(self):
-    #     with self.lock:
-    #         idx = torch.where(self.is_dirty)[0]
-    #         self.is_dirty[:] = False
-    #         return idx
-
-    # def set_intrinsics(self, K):
-    #     assert config["use_calib"]
-    #     with self.lock:
-    #         self.K[:] = K.cpu()
-
-    # def get_intrinsics(self):
-    #     assert config["use_calib"]
-    #     with self.lock:
-    #         return self.K.to(device=self.device)
-
-
-
 class KeyframesCuda:
     def __init__(self, h, w, buffer=200, dtype=torch.float32, device="cuda"):
         self.idx = -1
@@ -482,8 +528,28 @@ class KeyframesCuda:
         self.K = torch.zeros(3, 3, dtype=dtype, device=device)
         # fmt: on
 
+        self.buffer_size = buffer
+
     def reset(self):
         self.idx = -1
+        self.is_dirty[:] = False
+    def get_all_Xs(self):
+        if self.idx < self.buffer_size:
+            return self.X[:self.idx + 1]
+        else:
+            return self.X
+    
+    def get_all_imgs(self):
+        if self.idx < self.buffer_size:
+            return self.img[:self.idx + 1]
+        else:
+            return self.img
+
+    def get_all_poses(self):
+        if self.idx < self.buffer_size:
+            return self.T_WC[:self.idx + 1]
+        else:
+            return self.T_WC
 
     def __getitem__(self, idx) -> Frame:
         # NOTE: this is unsafe, idx is not checked. it can points to non-existing frames.

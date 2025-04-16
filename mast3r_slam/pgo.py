@@ -129,7 +129,11 @@ class OdomResidual(nn.Module):
 
 class PoseGraph:
     
-    def __init__(self, buffer_size=300, device='cuda'):
+    def __init__(self, buffer_size=300, device='cuda', local_opt_mode = False):
+        self.local_opt_mode = local_opt_mode
+        if not local_opt_mode:
+            return
+
         self.device = device
         self.buffer_size = buffer_size
 
@@ -154,6 +158,10 @@ class PoseGraph:
 
         self.graph_to_kf_idx = {}
 
+
+    def set_local_opt_mode(self, mode):
+        self.local_opt_mode = mode
+
     def reset(self):
         self._idx = -1
 
@@ -162,13 +170,14 @@ class PoseGraph:
         self.graph_to_kf_idx = {}
 
     def add_frame(self, frame):
-        self._idx += 1
-        idx = self._idx % self.buffer_size
-        self.Twc_SE3[idx]= frame.T_WC.data[0,:7].to(self.device) # (7)
-        self.scale[idx] = frame.T_WC.data[0,-1].to(self.device)
+        if self.local_opt_mode:
+            self._idx += 1
+            idx = self._idx % self.buffer_size
+            self.Twc_SE3[idx]= frame.T_WC.data[0,:7].to(self.device) # (7)
+            self.scale[idx] = frame.T_WC.data[0,-1].to(self.device)
 
-        if frame.odom is not None:
-            self.Todom_SE3[idx] = frame.odom.to(self.device)
+            if frame.odom is not None:
+                self.Todom_SE3[idx] = frame.odom.to(self.device)
     
         # self.Todom_SE3[idx] = frame.T_WC.data[0,:7].to(self.device).clone()
         # self.Todom_SE3[idx].tensor()[:3] *= 5 # scale translation
@@ -176,11 +185,13 @@ class PoseGraph:
 
     def last_frame_is_keyframe(self, kf_idx):
 
-        # indicate the last inserted frame is a keyframe
-        # useful for retreiving the pose of the keyframe from the pose graph
-        assert self._idx >= 0
+        if self.local_opt_mode:
 
-        self.graph_to_kf_idx[self._idx % self.buffer_size] = kf_idx
+            # indicate the last inserted frame is a keyframe
+            # useful for retreiving the pose of the keyframe from the pose graph
+            assert self._idx >= 0
+
+            self.graph_to_kf_idx[self._idx % self.buffer_size] = kf_idx
 
     def add_lc_edge_factor(self, i, j, T_lc):
         """
@@ -210,7 +221,7 @@ class PoseGraph:
     
     def optimize(self):
 
-        if self._idx < 10:
+        if not self.local_opt_mode or self._idx < 10:
             return False
 
         last_idx = min(self._idx + 1, self.buffer_size)

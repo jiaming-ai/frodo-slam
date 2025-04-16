@@ -21,6 +21,11 @@ class RetrievalDatabase(Retriever):
             device=self.query_device, dtype=self.query_dtype
         )
 
+    def reset(self):
+        self.kf_counter = 0
+        self.kf_ids = []
+        self.ivf_builder = self.asmk.create_ivf_builder()
+
     # Mirrors forward_local in extract_local_features from retrieval/model.py
     def prep_features(self, backbone_feat):
         retrieval_model = self.model

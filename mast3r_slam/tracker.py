@@ -103,33 +103,19 @@ class LocalMapOptimizer:
         
 
 class FrameTracker:
-    def __init__(self, model, frames, device, states):
+    def __init__(self, model, frames, device, local_opt_mode = False):
         self.cfg = config["tracking"]
         self.model = model
         self.keyframes = frames
-        self.states = states
         # cache the last keyframe
         self.last_kf = None
         self.device = device
 
         self.reset_idx_f2k()
         
-        self.local_opt = PoseGraph(device=self.device)
+        self.local_opt = PoseGraph(device=self.device, local_opt_mode=local_opt_mode)
 
 
-        # self._offset_to_current = [-1, -3, -5]
-        # self._local_window_size = 20
-
-        # # n key frame
-        # self._mode = Mode.INIT
-        # # the relative id from the current keyframe
-        # self.local_opt = LocalMapOptimizer(
-        #     model=self.model,
-        #     buffer_size=self._local_window_size, 
-        #     offset_to_current=self._offset_to_current,
-        #     device=self.device
-        # )
-    
     def reset(self, keyframes):
         """Reset the tracker
         Reset should be called after a new map is created
@@ -140,8 +126,6 @@ class FrameTracker:
         self.last_kf = None
 
         self.local_opt.reset()
-        # self._mode = Mode.INIT
-        # self.local_opt.reset()
 
     # Initialize with identity indexing of size (1,n)
     def reset_idx_f2k(self):
@@ -163,21 +147,24 @@ class FrameTracker:
             self.local_opt.last_frame_is_keyframe(0)
 
         self.keyframes.append(frame)
-        self.states.set_mode(Mode.TRACKING)
-        self.states.set_frame(frame)
-        self.last_kf = frame
+        # self.last_kf = frame
         self.img_shape = frame.img_true_shape
 
 
+    def set_opt_mode(self, mode):
+        self.local_opt.set_local_opt_mode(mode)
 
-    def track(self, frame: Frame) -> tuple[list, bool]:
+    @torch.inference_mode()
+    def track(self, frame: Frame) -> tuple[list, bool, bool]:
         """Track the frame
         Args:
             frame (Frame): frame to track
         Returns:
             list: list of results
-            bool: True if tracking failed
+            bool: True if tracking was successful
+            bool: True if new keyframe
         """
+        self.last_kf = self.keyframes.last_keyframe()
         # only Dff, Dkf is HxWxC
         idx_f2k, valid_match_k, Xff, Cff, Qff, Xkf, Ckf, Qkf, Dff, Dkf \
             = mast3r_match_asymmetric(
@@ -269,14 +256,14 @@ class FrameTracker:
                     )
                 if match_frac < self.cfg["min_match_frac_fnn"]:
                     print(f"Skipped frame {frame.frame_id} after fnn matching")
-                    return [], True
+                    return [], False, False
                 
                 # reset idx_f2k
                 self.reset_idx_f2k()
 
             else:
                 print(f"Skipped frame {frame.frame_id} without fnn matching")
-                return [], True
+                return [], False, False
 
 
 
@@ -316,7 +303,7 @@ class FrameTracker:
                 )
         except Exception as e:
             print(f"Cholesky failed {frame.frame_id}")
-            return [], True
+            return [], False, False
 
         frame.T_WC = T_WCf
 
@@ -328,6 +315,7 @@ class FrameTracker:
         Xkk = T_CkCf.act(Xkf)
         self.last_kf.update_pointmap(Xkk, Ckf)
         # write back the fitered pointmap
+        self.keyframes[len(self.keyframes) - 1] = self.last_kf
 
         unique_valid_match = torch.unique(idx_f2k[valid_kf[:, 0]]).shape[0] / valid_kf.numel()
         new_kf = unique_valid_match < self.cfg["match_frac_thresh"]
@@ -335,16 +323,16 @@ class FrameTracker:
         # Rest idx if new keyframe
         if new_kf:
             # update the keyframe in shared memory when new keyframe is created
-            self.keyframes[len(self.keyframes) - 1] = self.last_kf
+            # self.keyframes[len(self.keyframes) - 1] = self.last_kf
             self.reset_idx_f2k()
 
             # set the current frame as the last keyframe
-            self.last_kf = frame
+            # self.last_kf = frame
             idx = self.keyframes.append(frame)
 
             self.local_opt.last_frame_is_keyframe(idx)
 
-            # print(f"before optimize: {frame.T_WC.data[0]}")
+            # if local optimization is successful, update the keyframe poses
             success = self.local_opt.optimize()
             if success:
                 kf_poses, kf_idx = self.local_opt.get_kf_poses()
@@ -355,21 +343,6 @@ class FrameTracker:
                 # print(f"after optimize: {frame.T_WC.data[0]}")
 
 
-
-
-            # perform local optimization if a new keyframe is created
-            # self.local_opt.add_frame(frame, idx)
-
-            # T_WCs, unique_kf_idx_cache = self.local_opt.optimize(self._mode == Mode.INIT)
-            # if T_WCs is not None:
-            #     unique_kf_idx_cache = unique_kf_idx_cache.tolist()
-            #     unique_kf_idx = [self.local_opt.cache_to_frame_id[idx] for idx in unique_kf_idx_cache]
-
-            #     self.keyframes.update_T_WCs(T_WCs, torch.tensor(unique_kf_idx))
-            #     print(f"Local optimization done for frame {frame.frame_id}")
-            #     if self._mode == Mode.INIT:
-            #         self._mode = Mode.TRACKING
-
         return (
             [
                 self.last_kf.X_canon,
@@ -379,7 +352,8 @@ class FrameTracker:
                 Qkf,
                 Qff,
             ],
-            False,
+            True,
+            new_kf
         )
 
     def get_points_poses(self, frame, keyframe, idx_f2k, img_size, use_calib, K=None):

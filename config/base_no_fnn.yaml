@@ -10,9 +10,9 @@ matching:
   max_iter: 10
   lambda_init: 1e-8
   convergence_thresh: 1e-6
-  dist_thresh: 7e-1 # distance in 3D space
-  radius: 5
-  dilation_max: 7 # Right now starts from max and iteratively decreases until 1
+  dist_thresh: 1e-1 # distance in 3D space
+  radius: 3
+  dilation_max: 5 # Right now starts from max and iteratively decreases until 1
   ft_matching_threshold: 0.8
 
 tracking:

@@ -95,6 +95,23 @@ def mast3r_symmetric_inference(model, frame_i, frame_j):
 def mast3r_decode_symmetric_batch(
     model, feat_i, pos_i, feat_j, pos_j, shape_i, shape_j
 ):
+    """Decode two frames symmetrically
+
+    Args:
+        model (AsymmetricMASt3R): MASt3R model
+        feat_i (torch.Tensor): Feature of frame i
+        pos_i (torch.Tensor): Position of frame i
+        feat_j (torch.Tensor): Feature of frame j
+        pos_j (torch.Tensor): Position of frame j
+        shape_i (torch.Tensor): Shape of frames i, 1 x 2
+        shape_j (torch.Tensor): Shape of frames j, 1 x 2
+
+    Returns:
+        X (torch.Tensor): 4xbxhxwxc
+        C (torch.Tensor): 4xbxhxw
+        D (torch.Tensor): 4xbxhxwxc
+        Q (torch.Tensor): 4xbxhxw
+    """
     # let's do this in batch
     feat1 = torch.cat([feat_i, feat_j], dim=0)
     pos1 = torch.cat([pos_i, pos_j], dim=0)

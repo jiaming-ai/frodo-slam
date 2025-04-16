@@ -197,7 +197,6 @@ def main(args):
         viz.start()
 
     model = load_mast3r(device=device)
-    model.share_memory()
 
     has_calib = dataset.has_calib()
     use_calib = config["use_calib"]

@@ -18,6 +18,7 @@ from in3d.image import Image
 from moderngl_window import resources
 from moderngl_window.timers.clock import Timer
 import multiprocessing as mp
+import requests
 
 from mast3r_slam.frame import Mode
 from mast3r_slam.geometry import get_pixel_coords
@@ -38,6 +39,36 @@ class WindowMsg:
     next: bool = False
     C_conf_threshold: float = 1.5
 
+def send_robot_command(command, speed=0.5):
+    """
+    Send a command to the robot using the control API.
+    
+    Args:
+        command: Direction to move ("forward", "backward", "left", "right")
+        speed: Speed factor between 0 and 1
+    """
+    linear, angular = 0, 0
+    
+    if command == "forward":
+        linear = speed
+    elif command == "backward":
+        linear = -speed
+    elif command == "left":
+        angular = speed
+    elif command == "right":
+        angular = -speed
+    
+    try:
+        response = requests.post(
+            'http://localhost:8000/control',
+            json={'command': {'linear': linear, 'angular': angular}}
+        )
+        if response.status_code == 200:
+            print(f"Robot command sent: {command} (linear={linear}, angular={angular})")
+        else:
+            print(f"Failed to send robot command: {response.status_code}")
+    except Exception as e:
+        print(f"Error sending robot command: {e}")
 
 class Window(WindowEvents):
     title = "MASt3R-SLAM"
@@ -96,6 +127,20 @@ class Window(WindowEvents):
         self.main2viz = main2viz
         self.viz2main = viz2main
 
+        # Robot control settings
+        self.robot_speed = 0.5
+        self.last_key_time = 0
+        self.key_repeat_interval = 0.2  # seconds between repeated commands when key is held
+        self.key_states = {
+            self.wnd.keys.W: False,
+            self.wnd.keys.A: False,
+            self.wnd.keys.S: False,
+            self.wnd.keys.D: False,
+        }
+        
+        # Register key event handlers
+        self.wnd.key_event_func = self.key_event
+
     def set_keyframes(self, new_keyframes):
         """Update keyframes and clear textures to force redraw"""
         self.keyframes = new_keyframes
@@ -115,6 +160,11 @@ class Window(WindowEvents):
         print("set_keyframes", len(self.keyframes))
 
     def render(self, t: float, frametime: float):
+        # Process movement keys on each frame to handle continuous movement
+        current_time = self.timer.time
+        if any(self.key_states.values()) and current_time - self.last_key_time >= self.key_repeat_interval:
+            self.process_movement_keys()
+            
         self.viewport.use()
         self.ctx.enable(moderngl.DEPTH_TEST)
         if self.culling:
@@ -342,6 +392,24 @@ class Window(WindowEvents):
         image_with_text(self.kf_img, size, "kf", same_line=False)
         image_with_text(self.curr_img, size, "curr", same_line=False)
 
+        # Add robot control UI
+        imgui.spacing()
+        imgui.separator()
+        imgui.text("Robot Control")
+        imgui.text("Use WASD keys to control the robot")
+        _, self.robot_speed = imgui.slider_float(
+            "Robot Speed", self.robot_speed, 0.1, 1.0
+        )
+        _, self.key_repeat_interval = imgui.slider_float(
+            "Command Interval", self.key_repeat_interval, 0.05, 0.5
+        )
+        
+        if imgui.button("Stop"):
+            send_robot_command("stop", 0)
+            # Clear all key states when stopping
+            for key in self.key_states:
+                self.key_states[key] = False
+
         imgui.end()
 
         if new_state != self.state:
@@ -401,6 +469,46 @@ class Window(WindowEvents):
             return (Xs[..., 2:3].cpu().numpy().astype(np.float32) * self.dP_dz)[0]
 
         return frame.X_canon.cpu().numpy().astype(np.float32)
+
+    def key_event(self, key, action, modifiers):
+        """Handle keyboard input for robot control"""
+        # Only process keys we care about
+        if key not in self.key_states:
+            return
+            
+        if action == self.wnd.keys.ACTION_PRESS:
+            self.key_states[key] = True
+            # Send command immediately on press
+            self.process_movement_keys()
+        elif action == self.wnd.keys.ACTION_RELEASE:
+            self.key_states[key] = False
+            # Process keys again to handle case where one key is released but others still pressed
+            self.process_movement_keys()
+    
+    def process_movement_keys(self):
+        """Process the current state of movement keys and send appropriate command"""
+        current_time = self.timer.time
+        
+        # If no keys are pressed, stop the robot
+        if not any(self.key_states.values()):
+            send_robot_command("stop", 0)
+            return
+            
+        # Only send commands at the specified interval
+        if current_time - self.last_key_time < self.key_repeat_interval:
+            return
+            
+        self.last_key_time = current_time
+        
+        # Priority: forward/backward first, then left/right
+        if self.key_states[self.wnd.keys.W]:
+            send_robot_command("forward", self.robot_speed)
+        elif self.key_states[self.wnd.keys.S]:
+            send_robot_command("backward", self.robot_speed)
+        elif self.key_states[self.wnd.keys.A]:
+            send_robot_command("left", self.robot_speed)
+        elif self.key_states[self.wnd.keys.D]:
+            send_robot_command("right", self.robot_speed)
 
 
 def run_visualization(cfg, states, keyframes, main2viz, viz2main) -> None:

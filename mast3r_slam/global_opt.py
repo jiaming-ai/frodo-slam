@@ -1,6 +1,6 @@
 import lietorch
 import torch
-from mast3r_slam.config import config
+# from mast3r_slam.config import config
 from mast3r_slam.frame import SharedKeyframes
 from mast3r_slam.geometry import (
     constrain_points_to_ray,
@@ -10,7 +10,7 @@ import mast3r_slam_backends
 
 
 class FactorGraph:
-    def __init__(self, model, frames: SharedKeyframes, K=None, device="cuda"):
+    def __init__(self, model, frames: SharedKeyframes, config,K=None, device="cuda"):
         self.model = model
         self.frames = frames
         self.device = device
@@ -27,6 +27,18 @@ class FactorGraph:
 
         self.K = K
 
+    def reset(self):
+        self.ii = torch.as_tensor([], dtype=torch.long, device=self.device)
+        self.jj = torch.as_tensor([], dtype=torch.long, device=self.device)
+        self.idx_ii2jj = torch.as_tensor([], dtype=torch.long, device=self.device)
+        self.idx_jj2ii = torch.as_tensor([], dtype=torch.long, device=self.device)
+        self.valid_match_j = torch.as_tensor([], dtype=torch.bool, device=self.device)
+        self.valid_match_i = torch.as_tensor([], dtype=torch.bool, device=self.device)
+        self.Q_ii2jj = torch.as_tensor([], dtype=torch.float32, device=self.device)
+        self.Q_jj2ii = torch.as_tensor([], dtype=torch.float32, device=self.device)
+
+        
+
     def add_factors(self, ii, jj, min_match_frac, is_reloc=False):
         kf_ii = [self.frames[idx] for idx in ii]
         kf_jj = [self.frames[idx] for idx in jj]
@@ -34,8 +46,10 @@ class FactorGraph:
         feat_j = torch.cat([kf_j.feat for kf_j in kf_jj])
         pos_i = torch.cat([kf_i.pos for kf_i in kf_ii])
         pos_j = torch.cat([kf_j.pos for kf_j in kf_jj])
-        shape_i = [kf_i.img_true_shape for kf_i in kf_ii]
-        shape_j = [kf_j.img_true_shape for kf_j in kf_jj]
+        # shape_i = [kf_i.img_true_shape for kf_i in kf_ii]
+        # shape_j = [kf_j.img_true_shape for kf_j in kf_jj]
+        shape_i = self.frames[0].img_true_shape 
+        shape_j = self.frames[0].img_true_shape
 
         (
             idx_i2j,
@@ -150,6 +164,7 @@ class FactorGraph:
             sigma_dist,
             C_thresh,
             Q_thresh,
+            pin,
             max_iter,
             delta_thresh,
         )
