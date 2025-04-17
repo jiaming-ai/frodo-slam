@@ -4,11 +4,12 @@ import numpy as np
 from mast3r_slam.geometry import get_pixel_coords
 
 class Mapping:
-    def __init__(self, keyframes, config):
+    def __init__(self, keyframes, config, device):
+        self.device = device
         self.keyframes = keyframes
         self.config = config
         self.conf_threshold = 1
-        self.points = []
+        self.points_world = torch.tensor([], device=device)
 
         self.subsample_factor = 5
 
@@ -35,13 +36,32 @@ class Mapping:
 
         return X
 
-    def map_new_frame(self, frame):
+    def update_map(self, frame):
+        """Update the map with a new frame
+        Args:
+            frame: current frame
+        """
+        # mask = np.linalg.norm(self.points - current_pose, axis=-1) < 10
+        # self.points = self.points[mask]
 
         # get dirty keyframes
+        # and update the map
         kf_idxs = self.keyframes.get_dirty_map_idx()
-        if len(kf_idxs) == 0:
-            return
-        
-        Xs = self.get_all_X(kf_idxs) # [N, 3]
+        if len(kf_idxs) > 0:
+            Xs = self.get_all_X(kf_idxs) # [N, 3]
+            self.points_world = torch.cat([self.points_world, Xs], dim=0) # [N, 3]
+
+        # center the points
+        pos = frame.T_WC.data[0,:3] # [3]
+        points_cam = self.points_world - pos
+
+        # crop points too far from the camera
+
+        mask = points_cam[:,0]
+        self.points_world = self.points_world[mask]
+
+
+        # crop points too far from the camera
+        current_pose = frame.T_WC.data.cpu().numpy()[:3, 3]
 
         # voxelize

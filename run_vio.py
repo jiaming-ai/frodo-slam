@@ -6,11 +6,9 @@ import yaml
 import torch
 import numpy as np
 from mast3r_slam.config import load_config, config, set_global_config
-import rerun as rr
 
 from mast3r_slam.dataloader import load_dataset, Intrinsics
 from mast3r_slam.vio import VIO
-import mast3r_slam.evaluate as eval
 
 import sys
 import requests
