@@ -376,6 +376,59 @@ class SharedKeyframes:
         self.is_dirty = torch.zeros(buffer, 1, dtype=torch.bool, device="cpu").share_memory_()
         self.K = torch.zeros(3, 3, dtype=dtype, device="cpu").share_memory_()
         # fmt: on
+        self.is_dirty_map = torch.zeros(buffer, dtype=torch.bool, device="cpu").share_memory_()
+
+    def get_all_frame_ids(self):
+        with self.lock:
+            if self._idx.value < self.buffer_size:
+                return self.dataset_idx[:self._idx.value + 1].tolist()
+            else:
+                return self.dataset_idx.tolist()
+
+    def get_all_X(self):
+        with self.lock:
+            if self._idx.value < self.buffer_size:
+                return self.X[:self._idx.value + 1]
+            else:
+                return self.X
+    
+    def get_X_by_idxs(self, idxs):
+        with self.lock:
+            return self.X[idxs]
+    
+    def get_all_C(self):
+        with self.lock:
+            if self._idx.value < self.buffer_size:
+                return self.C[:self._idx.value + 1]
+            else:
+                return self.C
+
+    def get_C_by_idxs(self, idxs):
+        with self.lock:
+            return self.C[idxs]
+
+    def get_all_avg_C(self):
+        with self.lock:
+            if self._idx.value < self.buffer_size:
+                return self.C[:self._idx.value + 1] / self.N[:self._idx.value + 1]
+            else:
+                return self.C / self.N
+
+    def get_avg_C_by_idxs(self, idxs):
+        with self.lock:
+            return self.C[idxs] / self.N[idxs]
+
+    def get_all_T_WCs(self):
+        with self.lock:
+            if self._idx.value < self.buffer_size:
+                return self.T_WC[:self._idx.value + 1]
+            else:
+                return self.T_WC
+
+    def get_T_WC_by_idxs(self, idxs):
+        with self.lock:
+            return self.T_WC[idxs]
+
 
     def get_frame_cpu(self, idx) -> Frame:
         with self.lock:
@@ -443,6 +496,7 @@ class SharedKeyframes:
             self.N[idx] = value.N
             self.N_updates[idx] = value.N_updates
             self.is_dirty[idx] = True
+            self.is_dirty_map[idx] = True
             return idx
 
     def __len__(self):
@@ -454,6 +508,7 @@ class SharedKeyframes:
         with self.lock:
             self._idx.value = -1
             self.is_dirty[:] = False
+            self.is_dirty_map[:] = False
 
     def to_cpu(self):
         # Update device attribute
@@ -485,6 +540,12 @@ class SharedKeyframes:
         with self.lock:
             idx = torch.where(self.is_dirty)[0]
             self.is_dirty[:] = False
+            return idx
+
+    def get_dirty_map_idx(self):
+        with self.lock:
+            idx = torch.where(self.is_dirty_map)[0]
+            self.is_dirty_map[:] = False
             return idx
 
     def set_intrinsics(self, K):
