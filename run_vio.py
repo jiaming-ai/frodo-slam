@@ -157,7 +157,7 @@ def run_dataset(args):
     load_config(args.config)
     
     # Load dataset
-    dataset = load_dataset(os.path.join(args.dataset, "img"))
+    dataset = load_dataset(args.dataset)
     dataset.subsample(config["dataset"]["subsample"])
     h, w = dataset.get_img_shape()[0]
 
