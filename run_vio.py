@@ -239,5 +239,5 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     
-    # run_dataset(args)
-    run_robot(args)
+    run_dataset(args)
+    # run_robot(args)
