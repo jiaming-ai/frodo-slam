@@ -1,4 +1,5 @@
 import argparse
+import logging
 import os
 import pickle
 import time
@@ -236,8 +237,12 @@ if __name__ == "__main__":
                         help="Device to run on")
     parser.add_argument("--resize", type=int, default=512,
                         help="Resize image to this size (long edge)")
+    parser.add_argument("--debug", action="store_true",
+                        help="Debug mode")
 
     args = parser.parse_args()
+
+    logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO)
     
     run_dataset(args)
     # run_robot(args)

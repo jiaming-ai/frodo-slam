@@ -21,6 +21,8 @@ import matplotlib.pyplot as plt
 from mast3r_slam.matching import pixel_to_lin, lin_to_pixel
 from mast3r_slam.frame import Mode, KeyframesCuda
 from mast3r_slam.pgo import PoseGraph
+import logging
+
 class LocalMapOptimizer:
     def __init__(self, 
                  model,
@@ -322,6 +324,7 @@ class FrameTracker:
 
         # Rest idx if new keyframe
         if new_kf:
+            logging.debug(f"New keyframe {frame.frame_id}")
             # update the keyframe in shared memory when new keyframe is created
             # self.keyframes[len(self.keyframes) - 1] = self.last_kf
             self.reset_idx_f2k()

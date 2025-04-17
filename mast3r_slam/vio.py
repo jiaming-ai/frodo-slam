@@ -24,6 +24,7 @@ from mast3r_slam.tracker import FrameTracker
 import pypose as pp
 from mast3r_slam.visualization import run_visualization
 from mast3r_slam.config import config, set_global_config
+import logging
 
 def relocalization(frame, keyframes, factor_graph, retrieval_database, config):
     # we are adding and then removing from the keyframe, so we need to be careful.
@@ -43,7 +44,7 @@ def relocalization(frame, keyframes, factor_graph, retrieval_database, config):
             n_kf = len(keyframes)
             kf_idx = list(kf_idx)  # convert to list
             frame_idx = [n_kf - 1] * len(kf_idx)
-            print("RELOCALIZING against kf ", n_kf - 1, " and ", kf_idx)
+            logging.info(f"RELOCALIZING against kf {n_kf - 1} and {kf_idx}")
             if factor_graph.add_factors(
                 frame_idx,
                 kf_idx,
@@ -56,12 +57,12 @@ def relocalization(frame, keyframes, factor_graph, retrieval_database, config):
                     k=config["retrieval"]["k"],
                     min_thresh=config["retrieval"]["min_thresh"],
                 )
-                print("Success! Relocalized")
+                logging.info("Success! Relocalized")
                 successful_loop_closure = True
                 keyframes.T_WC[n_kf - 1] = keyframes.T_WC[kf_idx[0]].clone()
             else:
                 keyframes.pop_last()
-                print("Failed to relocalize")
+                logging.info("Failed to relocalize")
 
         if successful_loop_closure:
             if config["use_calib"]:
@@ -83,7 +84,7 @@ def run_backend(config, model, states, keyframes, main2backend, backend2main, K=
         try:
             msg = main2backend.get_nowait()
             if isinstance(msg, dict) and "reset" in msg:
-                print("Resetting backend")
+                logging.info("Resetting backend")
                 factor_graph.reset()
                 retrieval_database.reset()
 
@@ -127,7 +128,7 @@ def run_backend(config, model, states, keyframes, main2backend, backend2main, K=
         lc_inds = set(retrieval_inds)
         lc_inds.discard(idx - 1)
         if len(lc_inds) > 0:
-            print("Database retrieval", idx, ": ", lc_inds)
+            logging.info(f"Database retrieval {idx}: {lc_inds}")
 
         kf_idx = set(kf_idx)  # Remove duplicates by using set
         kf_idx.discard(idx)  # Remove current kf idx if included
@@ -223,6 +224,7 @@ class VIO:
 
     def reset(self):
         """Reset the VIO system"""
+        logging.info("Resetting VIO system")
         self.frame_count = 0
         self.loss_track_counter = 0
 
@@ -286,7 +288,7 @@ class VIO:
             # TODO: try relocalize if backend is running
             self.loss_track_counter += 1
             if self.loss_track_counter >= self.config["tracking"]["new_map_after_loss_track_N"]:
-                print(f"Creating new map after tracking loss for {self.loss_track_counter} frames...")
+                logging.info(f"Creating new map after tracking loss for {self.loss_track_counter} frames...")
                 self.reset()
                 self.tracker.init_tracking(frame)
                 self.states.set_frame(frame)
@@ -325,4 +327,4 @@ class VIO:
 if __name__ == "__main__":
     vio = VIO(config_path="config/base_no_fnn.yaml", img_size=(640, 640))
     vio.grab_rgb(np.zeros((640, 640, 3)))
-    print(vio.get_pose())
+    logging.info(vio.get_pose())
