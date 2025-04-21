@@ -1,5 +1,6 @@
 import datetime
 import os
+import lietorch
 import torch
 import torch.multiprocessing as mp
 import time
@@ -19,12 +20,11 @@ from mast3r_slam.mast3r_utils import (
     load_retriever,
 )
 from mast3r_slam.multiprocess_utils import new_queue
-from mast3r_slam.pgo import pos_yaw_to_se3
+from mast3r_slam.odometry import pos_yaw_to_se3
 from mast3r_slam.tracker import FrameTracker
-import pypose as pp
 from mast3r_slam.visualization import run_visualization
 from mast3r_slam.config import config, set_global_config
-import logging
+from loguru import logger
 
 def relocalization(frame, keyframes, factor_graph, retrieval_database, config):
     # we are adding and then removing from the keyframe, so we need to be careful.
@@ -44,7 +44,7 @@ def relocalization(frame, keyframes, factor_graph, retrieval_database, config):
             n_kf = len(keyframes)
             kf_idx = list(kf_idx)  # convert to list
             frame_idx = [n_kf - 1] * len(kf_idx)
-            logging.info(f"RELOCALIZING against kf {n_kf - 1} and {kf_idx}")
+            logger.info(f"RELOCALIZING against kf {n_kf - 1} and {kf_idx}")
             if factor_graph.add_factors(
                 frame_idx,
                 kf_idx,
@@ -57,12 +57,12 @@ def relocalization(frame, keyframes, factor_graph, retrieval_database, config):
                     k=config["retrieval"]["k"],
                     min_thresh=config["retrieval"]["min_thresh"],
                 )
-                logging.info("Success! Relocalized")
+                logger.info("Success! Relocalized")
                 successful_loop_closure = True
                 keyframes.T_WC[n_kf - 1] = keyframes.T_WC[kf_idx[0]].clone()
             else:
                 keyframes.pop_last()
-                logging.info("Failed to relocalize")
+                logger.info("Failed to relocalize")
 
         if successful_loop_closure:
             if config["use_calib"]:
@@ -83,10 +83,18 @@ def run_backend(config, model, states, keyframes, main2backend, backend2main, K=
     while mode is not Mode.TERMINATED:
         try:
             msg = main2backend.get_nowait()
-            if isinstance(msg, dict) and "reset" in msg:
-                logging.info("Resetting backend")
-                factor_graph.reset()
-                retrieval_database.reset()
+            if isinstance(msg, dict):
+                if "reset" in msg:
+                    logger.info("Resetting backend")
+                    factor_graph.reset()
+                    retrieval_database.reset()
+                if "odometry_factor" in msg:
+                    odometry = msg["odometry_factor"]
+                    factor_graph.add_odometry_factors(
+                        odometry["ii"], 
+                        odometry["jj"], 
+                        odometry["delta_T"]
+                        )
 
         except Exception as e:
             pass  # No message available
@@ -128,7 +136,7 @@ def run_backend(config, model, states, keyframes, main2backend, backend2main, K=
         lc_inds = set(retrieval_inds)
         lc_inds.discard(idx - 1)
         if len(lc_inds) > 0:
-            logging.info(f"Database retrieval {idx}: {lc_inds}")
+            logger.info(f"Database retrieval {idx}: {lc_inds}")
 
         kf_idx = set(kf_idx)  # Remove duplicates by using set
         kf_idx.discard(idx)  # Remove current kf idx if included
@@ -222,9 +230,11 @@ class VIO:
         self.loss_track_counter = 0
         self.states.set_mode(Mode.INIT)
 
+        self.last_odom_pose = lietorch.Sim3.Identity(1).to(self.device)
+
     def reset(self):
         """Reset the VIO system"""
-        logging.info("Resetting VIO system")
+        logger.info("Resetting VIO system")
         self.frame_count = 0
         self.loss_track_counter = 0
 
@@ -241,14 +251,24 @@ class VIO:
         if self.use_backend:
             self.main2backend.put({"reset": True})
 
-    def grab_rgb(self, img, timestamp=None, odom=None):
+        self.last_odom_pose = lietorch.Sim3.Identity(1).to(self.device)
+
+
+    def init_tracking(self, frame, odom_pose=None):
+        self.tracker.init_tracking(frame)
+        self.states.set_frame(frame)
+        self.states.set_mode(Mode.TRACKING)
+        # self.frame_count += 1
+        self.last_odom_pose = odom_pose
+
+    def grab_rgb(self, img, timestamp=None, odom_pose=None):
         """
         Process a new RGB frame and update the pose.
         
         Args:
             img: RGB image as numpy array (H, W, 3) with values in [0, 1]
             timestamp: Optional timestamp for the frame
-            odom: Optional odometry data (position, yaw)
+            odom_pose: Optional odometry pose
             
         Returns:
             success: Boolean indicating if tracking was successful
@@ -257,26 +277,20 @@ class VIO:
         if timestamp is None:
             timestamp = time.time()
             
-        # Add odometry data if available
-        if odom is not None:
-            odom_pose = pos_yaw_to_se3(odom['pos'], odom['yaw'])
-        else:
-            odom_pose = None
-            
+        if odom_pose is not None:
+            odom_pose = odom_pose.to(self.device)
+
         frame = create_frame(
             self.frame_count, 
             img, 
             self.states.get_pose(),
             img_size=512, # TODO
             device=self.device, 
-            odom=odom_pose
         )
         
         # Initialize tracking if needed
         if self.states.get_mode() == Mode.INIT:
-            self.tracker.init_tracking(frame)
-            self.states.set_frame(frame)
-            self.states.set_mode(Mode.TRACKING)
+            self.init_tracking(frame, odom_pose)
             self.frame_count += 1
             return True, self._get_current_pose(), True
             
@@ -288,12 +302,9 @@ class VIO:
             # TODO: try relocalize if backend is running
             self.loss_track_counter += 1
             if self.loss_track_counter >= self.config["tracking"]["new_map_after_loss_track_N"]:
-                logging.info(f"Creating new map after tracking loss for {self.loss_track_counter} frames...")
+                logger.info(f"Creating new map after tracking loss for {self.loss_track_counter} frames...")
                 self.reset()
-                self.tracker.init_tracking(frame)
-                self.states.set_frame(frame)
-                self.states.set_mode(Mode.TRACKING)
-                self.frame_count += 1
+                self.init_tracking(frame, odom_pose)
                 return False, self._get_current_pose(), True
         else:
             # Update frame if tracking is successful
@@ -301,6 +312,16 @@ class VIO:
             self.loss_track_counter = 0
             if self.use_backend and new_kf:
                 self.states.queue_global_optimization(len(self.keyframes) - 1)
+                # add odom factor
+                if odom_pose is not None and len(self.keyframes) > 1:
+                    delta_T = self.last_odom_pose.inv() * odom_pose
+                    self.main2backend.put({"odometry_factor": {
+                        "ii": len(self.keyframes) - 2,
+                        "jj": len(self.keyframes) - 1,
+                        "delta_T": delta_T
+                    }})
+
+                self.last_odom_pose = odom_pose
 
         self.frame_count += 1
         return track_success, self._get_current_pose(), new_kf
@@ -309,7 +330,7 @@ class VIO:
         """Get the current camera pose as a 4x4 transformation matrix"""
  
         # Convert from Sim3 to SE3 (4x4 matrix)
-        pose = pp.Sim3(self.states.T_WC).squeeze(0).matrix().cpu().numpy()
+        pose = self.states.T_WC.matrix().cpu().numpy()
         return pose
     
     def get_pose(self):
@@ -327,4 +348,4 @@ class VIO:
 if __name__ == "__main__":
     vio = VIO(config_path="config/base_no_fnn.yaml", img_size=(640, 640))
     vio.grab_rgb(np.zeros((640, 640, 3)))
-    logging.info(vio.get_pose())
+    logger.info(vio.get_pose())

@@ -25,6 +25,10 @@ class FactorGraph:
         self.Q_jj2ii = torch.as_tensor([], dtype=torch.float32, device=self.device)
         self.window_size = self.cfg["window_size"]
 
+        self.odometry_ii = torch.as_tensor([], dtype=torch.long, device=self.device)
+        self.odometry_jj = torch.as_tensor([], dtype=torch.long, device=self.device)
+        self.odometry_delta_T = torch.as_tensor([], dtype=torch.float32, device=self.device)
+
         self.K = K
 
     def reset(self):
@@ -37,7 +41,22 @@ class FactorGraph:
         self.Q_ii2jj = torch.as_tensor([], dtype=torch.float32, device=self.device)
         self.Q_jj2ii = torch.as_tensor([], dtype=torch.float32, device=self.device)
 
-        
+        self.odometry_ii = torch.as_tensor([], dtype=torch.long, device=self.device)
+        self.odometry_jj = torch.as_tensor([], dtype=torch.long, device=self.device)
+        self.odometry_delta_T = torch.as_tensor([], dtype=torch.float32, device=self.device)
+
+    def add_odometry_factors(self, ii, jj, delta_T):
+        """Add odometry factors to the factor graph
+        Make sure delta_T is a SE3 transformation, from jj to ii, 
+        i.e. delta_T = T_ii_inv * T_jj
+        Args:
+            ii (torch.Tensor): index of the first keyframe
+            jj (torch.Tensor): index of the second keyframe
+            delta_T (torch.Tensor): SE3 transformation from jj to ii
+        """
+        self.odometry_ii = torch.cat([self.odometry_ii, ii])
+        self.odometry_jj = torch.cat([self.odometry_jj, jj])
+        self.odometry_delta_T = torch.cat([self.odometry_delta_T, delta_T])
 
     def add_factors(self, ii, jj, min_match_frac, is_reloc=False):
         kf_ii = [self.frames[idx] for idx in ii]

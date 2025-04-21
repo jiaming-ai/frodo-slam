@@ -1,5 +1,4 @@
 import argparse
-import logging
 import os
 import pickle
 import time
@@ -10,7 +9,7 @@ from mast3r_slam.config import load_config, config, set_global_config
 
 from mast3r_slam.dataloader import load_dataset, Intrinsics
 from mast3r_slam.vio import VIO
-
+from mast3r_slam.odometry import StraightOrSpinOdometry
 import sys
 import requests
 import base64
@@ -19,6 +18,7 @@ import io
 import cv2 
 import threading
 from collections import deque
+from loguru import logger
 
 venv_bin = os.path.join(sys.prefix, 'bin')
 os.environ['PATH'] = venv_bin + os.pathsep + os.environ['PATH']
@@ -89,6 +89,11 @@ def run_robot(args):
         )
         K = camera_intrinsics.K_frame
     
+    odometry = StraightOrSpinOdometry(
+        directions_json="config/pixel_direction_dict_s.json"
+    )
+    odometry.start()
+
     # Initialize VIO
     vio = VIO(
         config=config,
@@ -98,17 +103,7 @@ def run_robot(args):
         visualize=args.visualize
     )
     
-    # Create thread-safe buffer for frames
-    image_buffer = deque(maxlen=10)
     stop_event = threading.Event()
-    
-    # Start frame fetching thread
-    fetch_thread = threading.Thread(
-        target=fetch_data, 
-        args=(image_buffer, stop_event, 0.1)  # Fetch every 0.1 seconds
-    )
-    fetch_thread.daemon = True
-    fetch_thread.start()
     
     # Process frames continuously
     frame_count = 0
@@ -118,24 +113,20 @@ def run_robot(args):
     
     try:
         while True:
-            # Check if we have frames in the buffer
-            if not image_buffer:
-                time.sleep(0.01)  # Short sleep if buffer is empty
-                continue
-            
             # Get the most recent frame
-            timestamp, frame = image_buffer[0]
+            timestamp, frame, odom_pose = odometry.get_frame_and_pose()
             
             # Check if enough time has passed since last processed frame
             if timestamp - last_processed_time < min_frame_interval:
                 time.sleep(0.01)  # Wait a bit before checking again
                 continue
                 
-            # Remove the frame we're about to process
-            image_buffer.popleft()
-            
             # Process frame
-            success, pose, new_kf = vio.grab_rgb(frame, timestamp, None)
+            success, pose, new_kf = vio.grab_rgb(
+                frame, 
+                timestamp, 
+                odom_pose
+                )
             last_processed_time = timestamp
             
             frame_count += 1
@@ -149,7 +140,7 @@ def run_robot(args):
     finally:
         # Signal thread to stop and wait for it
         stop_event.set()
-        fetch_thread.join(timeout=1.0)
+        odometry.stop()
         vio.terminate()
         print(f"Processed {frame_count} frames in {time.time() - start_time:.2f} seconds")
 
@@ -199,7 +190,10 @@ def run_dataset(args):
     start_time = time.time()
     frame_count = 0
     
+    every_n_frames = 4
     for i in range(len(dataset)):
+        if i % every_n_frames != 0:
+            continue
         timestamp, img = dataset[i]
         timestamps.append(timestamp)
         
@@ -225,7 +219,7 @@ def run_dataset(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run VIO on a dataset")
-    parser.add_argument("--dataset", default="datasets/tum/rgbd_dataset_freiburg1_desk", 
+    parser.add_argument("--dataset", default="datasets/tum/rgbd_dataset_freiburg1_360",
                         help="Path to dataset")
     parser.add_argument("--config", default="config/base_no_fnn.yaml", 
                         help="Path to config file")
@@ -242,7 +236,7 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO)
+    logger.add(sys.stdout, level="DEBUG" if args.debug else "INFO")
     
-    run_dataset(args)
-    # run_robot(args)
+    # run_dataset(args)
+    run_robot(args)

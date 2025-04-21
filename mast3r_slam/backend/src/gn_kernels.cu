@@ -965,6 +965,8 @@ __global__ void odom_constraint_kernel(
     // --- Thread Indexing ---
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
+    if (idx >= odom_ii.size(0)) return;
+
     // --- Get Pose Indices ---
     int ix = static_cast<int>(odom_ii[idx]);
     int jx = static_cast<int>(odom_jj[idx]);

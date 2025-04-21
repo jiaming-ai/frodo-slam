@@ -2,7 +2,7 @@ import torch
 import torch.nn.functional as F
 import mast3r_slam.image as img_utils
 from mast3r_slam.config import config
-import mast3r_slam_backends
+from mast3r_slam.backend import mast3r_slam_backends
 
 
 def match(X11, X21, D11, D21, idx_1_to_2_init=None):
