@@ -239,17 +239,6 @@ class Window(WindowEvents):
                     thickness=self.line_thickness * self.scale,
                 )
 
-            # TODO: we should delete the texture when the keyframe is deleted
-            existing_frame_ids = self.keyframes.get_all_frame_ids() + ['curr']
-            all_frame_ids = self.textures.keys() 
-            to_delete = [frame_id for frame_id in all_frame_ids if frame_id not in existing_frame_ids]
-            for frame_id in to_delete:
-                print(f"Deleting texture for frame_id: {frame_id}")
-                ptex, ctex, itex = self.textures[frame_id]
-                ptex.release()
-                ctex.release()
-                itex.release()
-                del self.textures[frame_id]
 
             ptex, ctex, itex = self.textures[keyframe.frame_id]
             if self.show_all:
@@ -299,6 +288,20 @@ class Window(WindowEvents):
 
         self.lines.render(self.camera)
         self.frustums.render(self.camera)
+
+        # TODO: we should delete the texture when the keyframe is deleted
+        existing_frame_ids = self.keyframes.get_all_frame_ids() + ['curr']
+        all_frame_ids = self.textures.keys() 
+        to_delete = [frame_id for frame_id in all_frame_ids if frame_id not in existing_frame_ids]
+        for frame_id in to_delete:
+            print(f"Deleting texture for frame_id: {frame_id}")
+            if frame_id in self.textures:
+                ptex, ctex, itex = self.textures[frame_id]
+                ptex.release()
+                ctex.release()
+                itex.release()
+                del self.textures[frame_id]
+
         self.render_ui()
 
     def render_ui(self):

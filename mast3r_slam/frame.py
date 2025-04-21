@@ -310,9 +310,9 @@ class SharedStates:
             frame.pos = self.pos
             return frame
 
-    def queue_global_optimization(self, idx):
+    def queue_global_optimization(self, idx, odom_factor=None):
         with self.lock:
-            self.global_optimizer_tasks.append(idx)
+            self.global_optimizer_tasks.append((idx, odom_factor))
 
     def queue_reloc(self):
         with self.lock:

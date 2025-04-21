@@ -88,13 +88,13 @@ def run_backend(config, model, states, keyframes, main2backend, backend2main, K=
                     logger.info("Resetting backend")
                     factor_graph.reset()
                     retrieval_database.reset()
-                if "odometry_factor" in msg:
-                    odometry = msg["odometry_factor"]
-                    factor_graph.add_odometry_factors(
-                        odometry["ii"], 
-                        odometry["jj"], 
-                        odometry["delta_T"]
-                        )
+                # if "odometry_factor" in msg:
+                #     odometry = msg["odometry_factor"]
+                #     factor_graph.add_odometry_factors(
+                #         odometry["ii"], 
+                #         odometry["jj"], 
+                #         odometry["delta_T"]
+                #         )
 
         except Exception as e:
             pass  # No message available
@@ -113,7 +113,7 @@ def run_backend(config, model, states, keyframes, main2backend, backend2main, K=
         idx = -1
         with states.lock:
             if len(states.global_optimizer_tasks) > 0:
-                idx = states.global_optimizer_tasks[0]
+                idx, (odom_ii, odom_jj, odom_delta_T) = states.global_optimizer_tasks[0]
         if idx == -1:
             time.sleep(0.01)
             continue
@@ -145,6 +145,10 @@ def run_backend(config, model, states, keyframes, main2backend, backend2main, K=
         if kf_idx:
             factor_graph.add_factors(
                 kf_idx, frame_idx, config["local_opt"]["min_match_frac"]
+            )
+        if odom_ii is not None:
+            factor_graph.add_odometry_factors(
+                odom_ii, odom_jj, odom_delta_T
             )
 
         with states.lock:
@@ -230,7 +234,7 @@ class VIO:
         self.loss_track_counter = 0
         self.states.set_mode(Mode.INIT)
 
-        self.last_odom_pose = lietorch.Sim3.Identity(1).to(self.device)
+        self.last_odom_pose = lietorch.Sim3.Identity(1)
 
     def reset(self):
         """Reset the VIO system"""
@@ -251,7 +255,7 @@ class VIO:
         if self.use_backend:
             self.main2backend.put({"reset": True})
 
-        self.last_odom_pose = lietorch.Sim3.Identity(1).to(self.device)
+        self.last_odom_pose = lietorch.Sim3.Identity(1)
 
 
     def init_tracking(self, frame, odom_pose=None):
@@ -277,9 +281,6 @@ class VIO:
         if timestamp is None:
             timestamp = time.time()
             
-        if odom_pose is not None:
-            odom_pose = odom_pose.to(self.device)
-
         frame = create_frame(
             self.frame_count, 
             img, 
@@ -311,16 +312,14 @@ class VIO:
             self.states.set_frame(frame)
             self.loss_track_counter = 0
             if self.use_backend and new_kf:
-                self.states.queue_global_optimization(len(self.keyframes) - 1)
                 # add odom factor
+                odom_factor = (None, None, None)
                 if odom_pose is not None and len(self.keyframes) > 1:
                     delta_T = self.last_odom_pose.inv() * odom_pose
-                    self.main2backend.put({"odometry_factor": {
-                        "ii": len(self.keyframes) - 2,
-                        "jj": len(self.keyframes) - 1,
-                        "delta_T": delta_T
-                    }})
+                    # note, the new keyframe is already added to the keyframes list in tracker.py
+                    odom_factor = ([len(self.keyframes) - 2], [len(self.keyframes) - 1], delta_T.data)
 
+                self.states.queue_global_optimization(len(self.keyframes) - 1, odom_factor)
                 self.last_odom_pose = odom_pose
 
         self.frame_count += 1
@@ -330,7 +329,7 @@ class VIO:
         """Get the current camera pose as a 4x4 transformation matrix"""
  
         # Convert from Sim3 to SE3 (4x4 matrix)
-        pose = self.states.T_WC.matrix().cpu().numpy()
+        pose = lietorch.Sim3(self.states.T_WC).cpu()
         return pose
     
     def get_pose(self):

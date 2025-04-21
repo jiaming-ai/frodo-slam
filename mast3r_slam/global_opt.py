@@ -50,13 +50,16 @@ class FactorGraph:
         Make sure delta_T is a SE3 transformation, from jj to ii, 
         i.e. delta_T = T_ii_inv * T_jj
         Args:
-            ii (torch.Tensor): index of the first keyframe
-            jj (torch.Tensor): index of the second keyframe
+            ii (list): index of the first keyframe
+            jj (list): index of the second keyframe
             delta_T (torch.Tensor): SE3 transformation from jj to ii
         """
-        self.odometry_ii = torch.cat([self.odometry_ii, ii])
-        self.odometry_jj = torch.cat([self.odometry_jj, jj])
-        self.odometry_delta_T = torch.cat([self.odometry_delta_T, delta_T])
+        ii_tensor = torch.as_tensor(ii, device=self.device)
+        jj_tensor = torch.as_tensor(jj, device=self.device)
+        delta_T_tensor = delta_T.unsqueeze(0).to(self.device)
+        self.odometry_ii = torch.cat([self.odometry_ii, ii_tensor])
+        self.odometry_jj = torch.cat([self.odometry_jj, jj_tensor])
+        self.odometry_delta_T = torch.cat([self.odometry_delta_T, delta_T_tensor], dim=0)
 
     def add_factors(self, ii, jj, min_match_frac, is_reloc=False):
         kf_ii = [self.frames[idx] for idx in ii]
@@ -151,6 +154,47 @@ class FactorGraph:
 
         return Xs, T_WCs, Cs
 
+    # def solve_GN_rays(self):
+    #     pin = self.cfg["pin"]
+    #     unique_kf_idx = self.get_unique_kf_idx()
+    #     n_unique_kf = unique_kf_idx.numel()
+    #     if n_unique_kf <= pin:
+    #         return
+
+    #     Xs, T_WCs, Cs = self.get_poses_points(unique_kf_idx)
+
+    #     ii, jj, idx_ii2jj, valid_match, Q_ii2jj = self.prep_two_way_edges()
+
+    #     C_thresh = self.cfg["C_conf"]
+    #     Q_thresh = self.cfg["Q_conf"]
+    #     max_iter = self.cfg["max_iters"]
+    #     sigma_ray = self.cfg["sigma_ray"]
+    #     sigma_dist = self.cfg["sigma_dist"]
+    #     delta_thresh = self.cfg["delta_norm"]
+
+    #     pose_data = T_WCs.data[:, 0, :]
+    #     mast3r_slam_backends.gauss_newton_rays(
+    #         pose_data,
+    #         Xs,
+    #         Cs,
+    #         ii,
+    #         jj,
+    #         idx_ii2jj,
+    #         valid_match,
+    #         Q_ii2jj,
+    #         sigma_ray,
+    #         sigma_dist,
+    #         C_thresh,
+    #         Q_thresh,
+    #         pin,
+    #         max_iter,
+    #         delta_thresh,
+    #     )
+
+    #     # Update the keyframe T_WC
+    #     # TODO how to update the updated poses?
+    #     self.frames.update_T_WCs(T_WCs[pin:], unique_kf_idx[pin:])
+
     def solve_GN_rays(self):
         pin = self.cfg["pin"]
         unique_kf_idx = self.get_unique_kf_idx()
@@ -170,7 +214,15 @@ class FactorGraph:
         delta_thresh = self.cfg["delta_norm"]
 
         pose_data = T_WCs.data[:, 0, :]
-        mast3r_slam_backends.gauss_newton_rays(
+
+        # add odometry factors
+        odom_ii = self.odometry_ii
+        odom_jj = self.odometry_jj
+        odom_delta_T = self.odometry_delta_T[:,0,:]
+        sigma_odom = 0.1
+
+
+        mast3r_slam_backends.gauss_newton_rays_odom(
             pose_data,
             Xs,
             Cs,
@@ -179,6 +231,10 @@ class FactorGraph:
             idx_ii2jj,
             valid_match,
             Q_ii2jj,
+            odom_ii, # odom edges, from i to j
+            odom_jj,
+            odom_delta_T, # Tj in Ti, or delta T between i and j
+            sigma_odom,
             sigma_ray,
             sigma_dist,
             C_thresh,

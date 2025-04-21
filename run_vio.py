@@ -9,7 +9,7 @@ from mast3r_slam.config import load_config, config, set_global_config
 
 from mast3r_slam.dataloader import load_dataset, Intrinsics
 from mast3r_slam.vio import VIO
-from mast3r_slam.odometry import StraightOrSpinOdometry
+from mast3r_slam.odometry import StraightOrSpinOdometry, OdometryData
 import sys
 import requests
 import base64
@@ -19,9 +19,12 @@ import cv2
 import threading
 from collections import deque
 from loguru import logger
-
+from mast3r_slam.map_visualization import MapVisualizer
 venv_bin = os.path.join(sys.prefix, 'bin')
 os.environ['PATH'] = venv_bin + os.pathsep + os.environ['PATH']
+
+
+        
 
 def get_frame(resize=512):
     response = requests.get('http://localhost:8000/v2/front')
@@ -65,9 +68,21 @@ def fetch_data(image_buffer, stop_event, interval=0.1):
 def run_robot(args):
     # Load config
     load_config(args.config)
+
+    # odometry = StraightOrSpinOdometry(
+    #     directions_json="config/pixel_direction_dict_s.json"
+    # )
+    # odometry.start()
+    odometry = OdometryData(
+        data_path="datasets/recorded/straight.pkl",
+        wall_clock=False,
+        use_odometry=True
+    )
     
-    # Get first frame to determine image size
-    frame = get_frame(args.resize)
+    # # Get first frame to determine image size
+    # frame = get_frame(args.resize)
+    timestamp, frame, odom_pose = odometry.get_frame_and_pose()
+
     if frame is None:
         print("Failed to get initial frame from robot camera")
         return
@@ -89,10 +104,6 @@ def run_robot(args):
         )
         K = camera_intrinsics.K_frame
     
-    odometry = StraightOrSpinOdometry(
-        directions_json="config/pixel_direction_dict_s.json"
-    )
-    odometry.start()
 
     # Initialize VIO
     vio = VIO(
@@ -110,17 +121,19 @@ def run_robot(args):
     last_processed_time = 0
     min_frame_interval = 0.03  # Minimum 30ms between frames (~33 FPS max)
     start_time = time.time()
-    
+
+    map_visualizer = MapVisualizer(visualization_enabled=False)
+    map_visualizer.visualize()
     try:
         while True:
             # Get the most recent frame
             timestamp, frame, odom_pose = odometry.get_frame_and_pose()
-            
-            # Check if enough time has passed since last processed frame
-            if timestamp - last_processed_time < min_frame_interval:
-                time.sleep(0.01)  # Wait a bit before checking again
+
+            if frame is None:
+                time.sleep(0.01)
+                # print("Waiting for frame...")
                 continue
-                
+            
             # Process frame
             success, pose, new_kf = vio.grab_rgb(
                 frame, 
@@ -135,13 +148,18 @@ def run_robot(args):
                 fps = frame_count / elapsed if elapsed > 0 else 0
                 print(f"Processed {frame_count} frames at {fps:.2f} FPS")
             
+            if new_kf and map_visualizer.visualization_enabled:
+                map_visualizer.add_pose_vio(pose)
+                map_visualizer.add_pose_odometry(odom_pose)
+            
     except KeyboardInterrupt:
         print(f"Interrupted after processing {frame_count} frames")
     finally:
         # Signal thread to stop and wait for it
         stop_event.set()
-        odometry.stop()
+        # odometry.stop()
         vio.terminate()
+        map_visualizer.terminate()
         print(f"Processed {frame_count} frames in {time.time() - start_time:.2f} seconds")
 
 def run_dataset(args):
@@ -236,7 +254,7 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    logger.add(sys.stdout, level="DEBUG" if args.debug else "INFO")
+    # logger.add(sys.stdout, level="DEBUG" if args.debug else "INFO")
     
     # run_dataset(args)
     run_robot(args)

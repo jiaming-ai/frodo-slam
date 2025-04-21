@@ -30,6 +30,38 @@ std::vector<torch::Tensor> gauss_newton_points(
   const int max_iter,
   const float delta_thresh);
 
+std::vector<torch::Tensor> gauss_newton_rays_odom(
+  torch::Tensor Twc, torch::Tensor Xs, torch::Tensor Cs,
+  torch::Tensor ii, torch::Tensor jj, 
+  torch::Tensor idx_ii2jj, torch::Tensor valid_match,
+  torch::Tensor Q,
+  torch::Tensor odom_ii, torch::Tensor odom_jj, // odom edges, from i to j
+  torch::Tensor Tij, // Tj in Ti, or delta T between i and j
+  const float sigma_odom,
+  const float sigma_ray,
+  const float sigma_dist,
+  const float C_thresh,
+  const float Q_thresh,
+  const int num_fix,
+  const int max_iter,
+  const float delta_thresh);
+
+std::vector<torch::Tensor> gauss_newton_rays_odom_cuda(
+  torch::Tensor Twc, torch::Tensor Xs, torch::Tensor Cs,
+  torch::Tensor ii, torch::Tensor jj, 
+  torch::Tensor idx_ii2jj, torch::Tensor valid_match,
+  torch::Tensor Q,
+  torch::Tensor odom_ii, torch::Tensor odom_jj, // odom edges, from i to j
+  torch::Tensor Tij, // Tj in Ti, or delta T between i and j
+  const float sigma_odom,
+  const float sigma_ray,
+  const float sigma_dist,
+  const float C_thresh,
+  const float Q_thresh,
+  const int num_fix,
+  const int max_iter,
+  const float delta_thresh);
+
 std::vector<torch::Tensor> gauss_newton_rays_cuda(
   torch::Tensor Twc, torch::Tensor Xs, torch::Tensor Cs,
   torch::Tensor ii, torch::Tensor jj, 

@@ -13,6 +13,8 @@ Run this file directly to see the real‑time visualisation.
 import base64
 import json
 import math
+import os
+import pickle
 import random
 import statistics
 import sys
@@ -120,7 +122,7 @@ class StraightOrSpinOdometry:
         poll_s: float = 0.1,
         timeout_s: float = 2.0,
     ):
-        # REST end‑points
+        # REST end‑points
         self._rpm_api, self._cam_api = rpm_api, cam_api
         self._poll_s, self._timeout = poll_s, timeout_s
 
@@ -157,7 +159,7 @@ class StraightOrSpinOdometry:
         with self._lock:
             return self._x, self._y, self._th
 
-    def get_frame_and_pose(self, resize = 512) -> Tuple[np.ndarray, Tuple[float, float, float]]:
+    def get_frame_and_pose(self, resize = 512) -> Tuple[float, np.ndarray, lietorch.SE3]:
 
         # TODO handles no frame case
         with self._lock:
@@ -165,6 +167,8 @@ class StraightOrSpinOdometry:
             pos = self._x, self._y
             yaw = self._th
         
+        if frame is None:
+            return None, None, None
         pose = pos_yaw_to_se3(pos, yaw)
         if frame.shape[2] == 4:
             frame = cv2.cvtColor(frame, cv2.COLOR_RGBA2RGB)
@@ -271,10 +275,15 @@ class StraightOrSpinOdometry:
             )
             # first compute yaw from frames
             if frame is not None and self._prev_frame is not None:
-                dth = self._yaw_from_rays(self._prev_frame, frame)
-                with self._lock:
-                    self._th = self._wrap(self._th + dth)
-                    self._path.append((self._x, self._y))
+                try:
+                    dth = self._yaw_from_rays(self._prev_frame, frame)
+                except Exception as e:
+                    logger.error(f"Error computing yaw from frames: {e}")
+                    dth = 0
+                if dth is not None:
+                    with self._lock:
+                        self._th = self._wrap(self._th + dth)
+                        self._path.append((self._x, self._y))
 
 
 
@@ -292,17 +301,15 @@ class StraightOrSpinOdometry:
                 straight = same_sign and close_mag
 
                 if straight:
+                    # only consider moving when the robot is moving straight
                     v = self._rpm_to_mps(rpm_l)
                     with self._lock:
                         self._x += v * math.cos(self._th) * dt
                         self._y += v * math.sin(self._th) * dt
                         self._path.append((self._x, self._y))
-                    dth = 0
 
             if frame is not None:
                 self._prev_frame = frame
-
-           
 
             time.sleep(self._poll_s)
 
@@ -468,14 +475,166 @@ class StraightOrSpinOdometry:
             print(f"Error sending robot command: {e}")
 
 
+def record_odometry(data_path: str, duration_s: float = 60.0, poll_s: float = 0.1):
+    """
+    Record odometry data to a file for the specified duration while showing visualization.
+    
+    Args:
+        data_path: Path to save the recorded data
+        duration_s: Duration to record in seconds
+        poll_s: Time between polls in seconds
+    """
+    
+    logger.info(f"Recording odometry data to {data_path} for {duration_s} seconds")
+    odo = StraightOrSpinOdometry(directions_json="config/pixel_direction_dict_s.json")
+    odo.start()
+    
+    # Start visualization in a separate thread
+    vis_thread = threading.Thread(target=odo.visualize, daemon=True)
+    vis_thread.start()
+    
+    try:
+        data = []
+        last_frame = None
+        start_time = time.time()
+        
+        while time.time() - start_time < duration_s:
+            # Get current timestamp, frame and pose
+            timestamp, frame, pose = odo.get_frame_and_pose()
+            if frame is None:
+                continue
+            
+            # Only store if frame is different from the last one
+            if last_frame is None or not np.array_equal(frame, last_frame):
+                data.append({
+                    'timestamp': timestamp,
+                    'frame': frame,
+                    'pose': pose,
+                })
+                last_frame = frame.copy()
+                logger.info(f"Recorded frame at t={timestamp:.2f}, pose={pose}")
+            
+            time.sleep(poll_s)
+        
+        # Save data to file
+        os.makedirs(os.path.dirname(data_path), exist_ok=True)
+        with open(data_path, 'wb') as f:
+            pickle.dump(data, f)
+        
+        logger.info(f"Recorded {len(data)} frames to {data_path}")
+    
+    finally:
+        odo.stop()
+
+def replay_odometry(data_path: str):
+    """
+    Load and replay odometry data from a file.
+    
+    Args:
+        data_path: Path to the recorded data file
+        
+    Returns:
+        List of dictionaries containing timestamp, frame, pose
+    """
+    
+    logger.info(f"Loading odometry data from {data_path}")
+    
+    try:
+        with open(data_path, 'rb') as f:
+            data = pickle.load(f)
+        
+        logger.info(f"Loaded {len(data)} frames from {data_path}")
+        return data
+    
+    except Exception as e:
+        logger.error(f"Failed to load odometry data: {e}")
+        return []
+
+class OdometryData(torch.utils.data.Dataset):
+    def __init__(self, data_path: str, wall_clock = False, use_odometry = False, **kwargs):
+        self.data = replay_odometry(data_path)
+        self.wall_clock = wall_clock
+        self.use_odometry = use_odometry
+        # For wall_clock mode
+        self.last_real_time = None
+        self.last_data_time = None
+        self.current_idx = 0
+        self.idx = 0
+
+    def __len__(self):
+        return len(self.data)
+    
+    def __getitem__(self, idx):
+        return self.data[idx]
+
+    def get_frame_and_pose(self):
+        """
+        Get frame and pose at the specified index or based on wall clock time.
+        
+        Args:
+            idx: Index to retrieve (ignored if wall_time=True)
+            
+        Returns:
+            timestamp, frame, pose tuple
+        """
+        if not self.wall_clock:
+            # Simple indexed access mode
+            if self.idx >= len(self.data):
+                return None, None, None
+            item = self.data[self.idx]
+            self.idx += 1
+            frame = item['frame'][:,:,::-1]
+            if self.use_odometry:
+                return item['timestamp'], frame, item['pose']
+            else:
+                return item['timestamp'], frame, None
+        
+        # Wall clock time simulation mode
+        current_real_time = time.time()
+        
+        # Initialize timing on first call
+        if self.last_real_time is None:
+            self.last_real_time = current_real_time
+            self.last_data_time = self.data[0]['timestamp']
+            self.current_idx = 0
+            if self.use_odometry:
+                return self.data[0]['timestamp'], self.data[0]['frame'], self.data[0]['pose']
+            else:
+                return self.data[0]['timestamp'], self.data[0]['frame'], None
+        
+        # Calculate elapsed time since last call
+        real_elapsed = current_real_time - self.last_real_time
+        target_data_time = self.last_data_time + real_elapsed
+        
+        # Find the frame with timestamp closest to but greater than target_data_time
+        while self.current_idx < len(self.data) - 1:
+            self.current_idx += 1
+            if self.data[self.current_idx]['timestamp'] > target_data_time:
+                break
+        
+        # Update timing state
+        self.last_real_time = current_real_time
+        self.last_data_time = self.data[self.current_idx]['timestamp']
+        
+        # Return the current frame and pose
+        item = self.data[self.current_idx]
+        frame = item['frame'][:,:,::-1]
+        if self.use_odometry:
+            return item['timestamp'], frame, item['pose']
+        else:
+            return item['timestamp'], frame, None
+        
 # ---------------------------------------------------------------------------
 # run standalone ------------------------------------------------------------
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    logger.add(sys.stdout, level="INFO")
-    odo = StraightOrSpinOdometry(directions_json="config/pixel_direction_dict_s.json")
-    odo.start()
-    try:
-        odo.visualize()
-    finally:
-        odo.stop()
+    # odo = StraightOrSpinOdometry(directions_json="config/pixel_direction_dict_s.json")
+    # odo.start()
+    # try:
+    #     odo.visualize()
+    # finally:
+    #     odo.stop()
+
+    record_odometry("datasets/recorded/easy.pkl", duration_s=30.0, poll_s=0.1)
+    # data = replay_odometry("odometry.pkl")
+    # print(data)
