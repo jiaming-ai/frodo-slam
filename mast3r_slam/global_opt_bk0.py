@@ -13,44 +13,48 @@ from mast3r_slam.height_prior import RectanglePlaneEstimator
 
 
 class FactorGraph:
-    def __init__(self, model, frames: SharedKeyframes, config, K=None, device="cuda"):
+    def __init__(self, model, frames: SharedKeyframes, config,K=None, device="cuda"):
         self.model = model
         self.frames = frames
         self.device = device
         self.cfg = config["local_opt"]
-        self.K = K
+        self.ii = torch.as_tensor([], dtype=torch.long, device=self.device)
+        self.jj = torch.as_tensor([], dtype=torch.long, device=self.device)
+        self.idx_ii2jj = torch.as_tensor([], dtype=torch.long, device=self.device)
+        self.idx_jj2ii = torch.as_tensor([], dtype=torch.long, device=self.device)
+        self.valid_match_j = torch.as_tensor([], dtype=torch.bool, device=self.device)
+        self.valid_match_i = torch.as_tensor([], dtype=torch.bool, device=self.device)
+        self.Q_ii2jj = torch.as_tensor([], dtype=torch.float32, device=self.device)
+        self.Q_jj2ii = torch.as_tensor([], dtype=torch.float32, device=self.device)
         self.window_size = self.cfg["window_size"]
 
-        # Store edges as separate lists instead of tensors
-        self._ii_list = []
-        self._jj_list = []
-        self._idx_ii2jj_list = []
-        self._idx_jj2ii_list = []
-        self._valid_match_j_list = []
-        self._valid_match_i_list = []
-        self._Q_ii2jj_list = []
-        self._Q_jj2ii_list = []
+        self.odometry_ii = torch.as_tensor([], dtype=torch.long, device=self.device)
+        self.odometry_jj = torch.as_tensor([], dtype=torch.long, device=self.device)
+        self.odometry_delta_T = torch.as_tensor([], dtype=torch.float32, device=self.device)
 
-        # Store odometry edges as separate lists
-        self._odometry_ii_list = []
-        self._odometry_jj_list = []
-        self._odometry_delta_T_list = []
+        self.K = K
 
     def reset(self):
-        # Clear all edge lists
-        self._ii_list = []
-        self._jj_list = []
-        self._idx_ii2jj_list = []
-        self._idx_jj2ii_list = []
-        self._valid_match_j_list = []
-        self._valid_match_i_list = []
-        self._Q_ii2jj_list = []
-        self._Q_jj2ii_list = []
+        self.ii = torch.as_tensor([], dtype=torch.long, device=self.device)
+        self.jj = torch.as_tensor([], dtype=torch.long, device=self.device)
+        self.idx_ii2jj = torch.as_tensor([], dtype=torch.long, device=self.device)
+        self.idx_jj2ii = torch.as_tensor([], dtype=torch.long, device=self.device)
+        self.valid_match_j = torch.as_tensor([], dtype=torch.bool, device=self.device)
+        self.valid_match_i = torch.as_tensor([], dtype=torch.bool, device=self.device)
+        self.Q_ii2jj = torch.as_tensor([], dtype=torch.float32, device=self.device)
+        self.Q_jj2ii = torch.as_tensor([], dtype=torch.float32, device=self.device)
 
-        # Clear odometry lists
-        self._odometry_ii_list = []
-        self._odometry_jj_list = []
-        self._odometry_delta_T_list = []
+        self.odometry_ii = torch.as_tensor([], dtype=torch.long, device=self.device)
+        self.odometry_jj = torch.as_tensor([], dtype=torch.long, device=self.device)
+        self.odometry_delta_T = torch.as_tensor([], dtype=torch.float32, device=self.device)
+
+    @property
+    def _ii_list(self):
+        return self.ii.tolist()
+
+    @property
+    def _jj_list(self):
+        return self.jj.tolist()
 
     def add_odometry_factors(self, ii, jj, delta_T):
         """Add odometry factors to the factor graph
@@ -61,11 +65,17 @@ class FactorGraph:
             jj (list): index of the second keyframe
             delta_T (torch.Tensor): SE3 transformation from jj to ii
         """
-        delta_T = delta_T.unsqueeze(0).to(self.device)
-        self._odometry_ii_list.append(ii)
-        self._odometry_jj_list.append(jj)
-        self._odometry_delta_T_list.append(delta_T)
-    
+        if not isinstance(ii, list):
+            ii = [ii]
+        if not isinstance(jj, list):
+            jj = [jj]
+        ii = torch.tensor(ii, device=self.device)
+        jj = torch.tensor(jj, device=self.device)
+        delta_T_tensor = delta_T.unsqueeze(0).to(self.device)
+        self.odometry_ii = torch.cat([self.odometry_ii, ii])
+        self.odometry_jj = torch.cat([self.odometry_jj, jj])
+        self.odometry_delta_T = torch.cat([self.odometry_delta_T, delta_T_tensor], dim=0)
+
     def add_factors(self, ii, jj, min_match_frac, is_reloc=False):
         kf_ii = [self.frames[idx] for idx in ii]
         kf_jj = [self.frames[idx] for idx in jj]
@@ -73,6 +83,8 @@ class FactorGraph:
         feat_j = torch.cat([kf_j.feat for kf_j in kf_jj]).to(self.device)
         pos_i = torch.cat([kf_i.pos for kf_i in kf_ii]).to(self.device)
         pos_j = torch.cat([kf_j.pos for kf_j in kf_jj]).to(self.device)
+        # shape_i = [kf_i.img_true_shape for kf_i in kf_ii]
+        # shape_j = [kf_j.img_true_shape for kf_j in kf_jj]
         shape_i = self.frames[0].img_true_shape 
         shape_j = self.frames[0].img_true_shape
 
@@ -95,7 +107,6 @@ class FactorGraph:
         Qj = torch.sqrt(Qii[batch_inds, idx_i2j] * Qji)
         Qi = torch.sqrt(Qjj[batch_inds, idx_j2i] * Qij)
 
-        # TODO: we can store only subset of Xs and Cs, that are valid and above threshold
         valid_Qj = Qj > self.cfg["Q_conf"]
         valid_Qi = Qi > self.cfg["Q_conf"]
         valid_j = valid_match_j & valid_Qj
@@ -126,81 +137,28 @@ class FactorGraph:
         Qj = Qj[valid_edges]
         Qi = Qi[valid_edges]
 
-        # Store valid edges in separate lists instead of a single tuple
-        self._ii_list = self._ii_list + ii_tensor.tolist()
-        self._jj_list = self._jj_list + jj_tensor.tolist()
-        for i in range(len(ii_tensor)):
-            self._idx_ii2jj_list.append(idx_i2j[i])
-            self._idx_jj2ii_list.append(idx_j2i[i])
-            self._valid_match_j_list.append(valid_j[i])
-            self._valid_match_i_list.append(valid_i[i])
-            self._Q_ii2jj_list.append(Qij[i])
-            self._Q_jj2ii_list.append(Qji[i])
+        self.ii = torch.cat([self.ii, ii_tensor])
+        self.jj = torch.cat([self.jj, jj_tensor])
+        self.idx_ii2jj = torch.cat([self.idx_ii2jj, idx_i2j])
+        self.idx_jj2ii = torch.cat([self.idx_jj2ii, idx_j2i])
+        self.valid_match_j = torch.cat([self.valid_match_j, valid_match_j])
+        self.valid_match_i = torch.cat([self.valid_match_i, valid_match_i])
+        self.Q_ii2jj = torch.cat([self.Q_ii2jj, Qj])
+        self.Q_jj2ii = torch.cat([self.Q_jj2ii, Qi])
 
         added_new_edges = valid_edges.sum() > 0
         return added_new_edges
 
-    def _materialise_edges(self):
-        if not self._ii_list:
-            return False
-
-        oldest_alive = self.frames.oldest_alive_idx()
-        
-        # Filter edges based on oldest alive index
-        survivors = []
-        for i in range(len(self._ii_list)):
-            if self._ii_list[i] >= oldest_alive and self._jj_list[i] >= oldest_alive:
-                survivors.append(i)
-        
-        # Keep only surviving edges
-        self._ii_list = [self._ii_list[i] for i in survivors]
-        self._jj_list = [self._jj_list[i] for i in survivors]
-        self._idx_ii2jj_list = [self._idx_ii2jj_list[i] for i in survivors]
-        self._idx_jj2ii_list = [self._idx_jj2ii_list[i] for i in survivors]
-        self._valid_match_j_list = [self._valid_match_j_list[i] for i in survivors]
-        self._valid_match_i_list = [self._valid_match_i_list[i] for i in survivors]
-        self._Q_ii2jj_list = [self._Q_ii2jj_list[i] for i in survivors]
-        self._Q_jj2ii_list = [self._Q_jj2ii_list[i] for i in survivors]
-        
-        # Filter odometry edges
-        odom_survivors = []
-        for i in range(len(self._odometry_ii_list)):
-            if self._odometry_ii_list[i] >= oldest_alive and self._odometry_jj_list[i] >= oldest_alive:
-                odom_survivors.append(i)
-        
-        self._odometry_ii_list = [self._odometry_ii_list[i] for i in odom_survivors]
-        self._odometry_jj_list = [self._odometry_jj_list[i] for i in odom_survivors]
-        self._odometry_delta_T_list = [self._odometry_delta_T_list[i] for i in odom_survivors]
-
-        if not self._ii_list:
-            return False
-
-        return True
-
     def get_unique_kf_idx(self):
-        # Convert lists to tensors for processing
-        ii = torch.tensor(self._ii_list, dtype=torch.long, device=self.device)
-        jj = torch.tensor(self._jj_list, dtype=torch.long, device=self.device)
-        return torch.unique(torch.cat([ii, jj]), sorted=True)
+        return torch.unique(torch.cat([self.ii, self.jj]), sorted=True)
 
     def prep_two_way_edges(self):
-        # Convert lists to tensors for processing
-        ii = torch.tensor(self._ii_list, dtype=torch.long, device=self.device)
-        jj = torch.tensor(self._jj_list, dtype=torch.long, device=self.device)
-        idx_ii2jj = torch.stack(self._idx_ii2jj_list)
-        valid_match_j = torch.stack(self._valid_match_j_list)
-        valid_match_i = torch.stack(self._valid_match_i_list)
-        Q_ii2jj = torch.stack(self._Q_ii2jj_list)
-        Q_jj2ii = torch.stack(self._Q_jj2ii_list)
-        
-        # Create two-way edges
-        ii_two_way = torch.cat((ii, jj), dim=0)
-        jj_two_way = torch.cat((jj, ii), dim=0)
-        idx_ii2jj_two_way = torch.cat((idx_ii2jj, torch.stack(self._idx_jj2ii_list)), dim=0)
-        valid_match_two_way = torch.cat((valid_match_j, valid_match_i), dim=0)
-        Q_ii2jj_two_way = torch.cat((Q_ii2jj, Q_jj2ii), dim=0)
-        
-        return ii_two_way, jj_two_way, idx_ii2jj_two_way, valid_match_two_way, Q_ii2jj_two_way
+        ii = torch.cat((self.ii, self.jj), dim=0)
+        jj = torch.cat((self.jj, self.ii), dim=0)
+        idx_ii2jj = torch.cat((self.idx_ii2jj, self.idx_jj2ii), dim=0)
+        valid_match = torch.cat((self.valid_match_j, self.valid_match_i), dim=0)
+        Q_ii2jj = torch.cat((self.Q_ii2jj, self.Q_jj2ii), dim=0)
+        return ii, jj, idx_ii2jj, valid_match, Q_ii2jj
 
     def get_poses_points(self, unique_kf_idx):
         kfs = [self.frames[idx] for idx in unique_kf_idx]
@@ -210,6 +168,7 @@ class FactorGraph:
         Cs = torch.stack([kf.get_average_conf() for kf in kfs])
 
         # compute h bar
+        start = time.time()
         pe = RectanglePlaneEstimator()
         camera_height = StraightOrSpinOdometry._CAMERA_HEIGHT
         s_residuals = []
@@ -220,14 +179,54 @@ class FactorGraph:
                 s_residuals.append(camera_height / h_bar)
             else:
                 s_residuals.append(-1)
+        end = time.time()
+        print(f"Time taken: {end - start} seconds")
 
         return Xs, T_WCs, Cs, s_residuals
 
-    def solve_GN_rays(self):
-        has_edges = self._materialise_edges()
-        if not has_edges:
-            return
+    # def solve_GN_rays(self):
+    #     pin = self.cfg["pin"]
+    #     unique_kf_idx = self.get_unique_kf_idx()
+    #     n_unique_kf = unique_kf_idx.numel()
+    #     if n_unique_kf <= pin:
+    #         return
 
+    #     Xs, T_WCs, Cs = self.get_poses_points(unique_kf_idx)
+
+    #     ii, jj, idx_ii2jj, valid_match, Q_ii2jj = self.prep_two_way_edges()
+
+    #     C_thresh = self.cfg["C_conf"]
+    #     Q_thresh = self.cfg["Q_conf"]
+    #     max_iter = self.cfg["max_iters"]
+    #     sigma_ray = self.cfg["sigma_ray"]
+    #     sigma_dist = self.cfg["sigma_dist"]
+    #     delta_thresh = self.cfg["delta_norm"]
+
+    #     pose_data = T_WCs.data[:, 0, :]
+    #     dx = mast3r_slam_backends.gauss_newton_rays(
+    #         pose_data,
+    #         Xs,
+    #         Cs,
+    #         ii,
+    #         jj,
+    #         idx_ii2jj,
+    #         valid_match,
+    #         Q_ii2jj,
+    #         sigma_ray,
+    #         sigma_dist,
+    #         C_thresh,
+    #         Q_thresh,
+    #         pin,
+    #         max_iter,
+    #         delta_thresh,
+    #     )
+    #     print(f"dx: {dx}")
+
+    #     # Update the keyframe T_WC
+    #     # TODO how to update the updated poses?
+    #     self.frames.update_T_WCs(T_WCs[pin:], unique_kf_idx[pin:])
+
+    def solve_GN_rays(self):
         pin = self.cfg["pin"]
         unique_kf_idx = self.get_unique_kf_idx()
         n_unique_kf = unique_kf_idx.numel()
@@ -235,12 +234,8 @@ class FactorGraph:
             return
 
         Xs, T_WCs, Cs, s_bar = self.get_poses_points(unique_kf_idx)
-        ii, jj, idx_ii2jj, valid_match, Q_ii2jj = self.prep_two_way_edges()
 
-        # Convert odometry lists to tensors
-        odom_ii = torch.tensor(self._odometry_ii_list, dtype=torch.long, device=self.device)
-        odom_jj = torch.tensor(self._odometry_jj_list, dtype=torch.long, device=self.device)
-        odom_delta_T = torch.cat(self._odometry_delta_T_list, dim=0)[:,0,:]
+        ii, jj, idx_ii2jj, valid_match, Q_ii2jj = self.prep_two_way_edges()
 
         C_thresh = self.cfg["C_conf"]
         Q_thresh = self.cfg["Q_conf"]
@@ -251,24 +246,30 @@ class FactorGraph:
 
         pose_data = T_WCs.data[:, 0, :]
 
-        sigma_odom_t = 0.002
-        sigma_odom_r = 0.005
-        sigma_ray = 0.1
+        # add odometry factors
+        odom_ii = self.odometry_ii
+        odom_jj = self.odometry_jj
+        odom_delta_T = self.odometry_delta_T[:,0,:]
+        sigma_odom_t = 0.001
+        sigma_odom_r = 0.01
+        sigma_ray = 0.01
         sigma_scale_prior = 1
         s_bar = torch.tensor(s_bar)
+        # print(f"s_bar: {s_bar}")
+
 
         dx = mast3r_slam_backends.gauss_newton_rays_odom(
-            pose_data.to(self.device),
-            Xs.to(self.device),
-            Cs.to(self.device),
+            pose_data,
+            Xs,
+            Cs,
             ii,
             jj,
             idx_ii2jj,
             valid_match,
             Q_ii2jj,
-            odom_ii,
+            odom_ii, # odom edges, from i to j
             odom_jj,
-            odom_delta_T,
+            odom_delta_T, # Tj in Ti, or delta T between i and j
             s_bar,
             sigma_odom_t,
             sigma_odom_r,
@@ -281,8 +282,10 @@ class FactorGraph:
             max_iter,
             delta_thresh,
         )
+        # print(f"dx: {dx}")
 
         # Update the keyframe T_WC
+        # TODO how to update the updated poses?
         self.frames.update_T_WCs(T_WCs[pin:], unique_kf_idx[pin:])
 
     def solve_GN_calib(self):

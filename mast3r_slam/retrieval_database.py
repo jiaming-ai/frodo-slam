@@ -46,7 +46,7 @@ class RetrievalDatabase(Retriever):
         return topk_features
 
     def update(self, frame, add_after_query, k, min_thresh=0.0):
-        feat = self.prep_features(frame.feat)
+        feat = self.prep_features(frame.feat.to(self.device))
         id = self.kf_counter  # Using own counter since otherwise messes up IVF
 
         feat_np = feat[0].cpu().numpy()  # Assumes one frame at a time!

@@ -168,6 +168,7 @@ class FrameTracker:
             bool: True if new keyframe
         """
         self.last_kf = self.keyframes.last_keyframe()
+        self.last_kf.to_device(self.device)
         # only Dff, Dkf is HxWxC
         idx_f2k, valid_match_k, Xff, Cff, Qff, Xkf, Ckf, Qkf, Dff, Dkf \
             = mast3r_match_asymmetric(

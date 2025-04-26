@@ -32,6 +32,18 @@ class Frame:
     odom: Optional[torch.Tensor] = None
     X_traversability: Optional[torch.Tensor] = None
 
+    def to_device(self, device):
+        self.img = self.img.to(device)
+        self.img_shape = self.img_shape.to(device)
+        self.img_true_shape = self.img_true_shape.to(device)
+        self.T_WC = self.T_WC.to(device)
+        self.X_canon = self.X_canon.to(device)
+        self.C = self.C.to(device)
+        self.feat = self.feat.to(device)
+        self.pos = self.pos.to(device)
+        # self.odom = self.odom.to(device)
+        # self.X_traversability = self.X_traversability.to(device)
+        
     def fit_ground_plane(self):
         """
         fit a ground plane to the pointcloud
@@ -346,7 +358,7 @@ class SharedStates:
 
 
 class SharedKeyframes:
-    def __init__(self, manager, h, w, buffer=300, dtype=torch.float32, device="cuda"):
+    def __init__(self, manager, h, w, buffer=300, dtype=torch.float32):
         self.lock = manager.RLock()
         # self.n_size = manager.Value("i", 0)
         self._idx = manager.Value("i", -1)
@@ -354,7 +366,6 @@ class SharedKeyframes:
         self.h, self.w = h, w
         self.buffer_size = buffer
         self.dtype = dtype
-        self.device = device  # Store the target device for when we return frames
 
         self.feat_dim = 1024
         self.num_patches = h * w // (16 * 16)
@@ -460,20 +471,20 @@ class SharedKeyframes:
             # Move data to the target device when returning a frame
             kf = Frame(
                 int(self.dataset_idx[idx]),
-                self.img[idx].to(device=self.device),
-                self.img_shape[idx].to(device=self.device),
-                self.img_true_shape[idx].to(device=self.device),
+                self.img[idx],
+                self.img_shape[idx],
+                self.img_true_shape[idx],
                 self.uimg[idx],  # uimg stays on CPU
-                lietorch.Sim3(self.T_WC[idx].to(device=self.device)),
+                lietorch.Sim3(self.T_WC[idx]),
             )
-            kf.X_canon = self.X[idx].to(device=self.device)
-            kf.C = self.C[idx].to(device=self.device)
-            kf.feat = self.feat[idx].to(device=self.device)
-            kf.pos = self.pos[idx].to(device=self.device)
+            kf.X_canon = self.X[idx]
+            kf.C = self.C[idx]
+            kf.feat = self.feat[idx]
+            kf.pos = self.pos[idx]
             kf.N = int(self.N[idx])
             kf.N_updates = int(self.N_updates[idx])
             if config["use_calib"]:
-                kf.K = self.K.to(device=self.device)
+                kf.K = self.K
             return kf
 
     def __setitem__(self, idx, value: Frame) -> None:
@@ -497,6 +508,7 @@ class SharedKeyframes:
             self.N_updates[idx] = value.N_updates
             self.is_dirty[idx] = True
             self.is_dirty_map[idx] = True
+
             return idx
 
     def __len__(self):
@@ -504,16 +516,19 @@ class SharedKeyframes:
             # Return the actual number of frames, capped by buffer size
             return min(self._idx.value + 1, self.buffer_size)
 
+    def oldest_alive_idx(self):
+        # public helper
+        with self.lock:
+            return max(0, self._idx.value - self.buffer_size + 1)
+    
+    def get_last_idx(self):
+        with self.lock:
+            return self._idx.value
     def reset(self):
         with self.lock:
             self._idx.value = -1
             self.is_dirty[:] = False
             self.is_dirty_map[:] = False
-
-    def to_cpu(self):
-        # Update device attribute
-        self.device = "cpu"
-
 
     def append(self, value: Frame):
         with self.lock:

@@ -11,7 +11,7 @@ from mast3r_slam.config import config
 import mast3r_slam.matching as matching
 
 
-def load_mast3r(path=None, device="cuda", compile=True):
+def load_mast3r(path=None, device="cuda", compile=False):
     weights_path = (
         "checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth"
         if path is None

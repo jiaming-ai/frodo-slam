@@ -126,6 +126,7 @@ class StraightOrSpinOdometry:
     _WHEEL_DIAM_M = 0.13
     _TRACK_M = 0.2
     _CAMERA_OFFSET_M = 0.06
+    _CAMERA_HEIGHT = 0.561
 
     _CIRC_M = math.pi * _WHEEL_DIAM_M
     _RPM_EQ_EPS = 5

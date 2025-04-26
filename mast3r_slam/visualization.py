@@ -246,8 +246,8 @@ class Window(WindowEvents):
 
         if self.show_keyframe_edges:
             with self.states.lock:
-                ii = torch.tensor(self.states.edges_ii, dtype=torch.long)
-                jj = torch.tensor(self.states.edges_jj, dtype=torch.long)
+                ii = torch.tensor(list(self.states.edges_ii), dtype=torch.long)
+                jj = torch.tensor(list(self.states.edges_jj), dtype=torch.long)
             if ii.numel() > 0 and jj.numel() > 0:
                 T_WCi = lietorch.Sim3(self.keyframes.T_WC[ii, 0])
                 T_WCj = lietorch.Sim3(self.keyframes.T_WC[jj, 0])

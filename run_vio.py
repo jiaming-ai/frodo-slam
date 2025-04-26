@@ -73,7 +73,7 @@ def run_robot(args):
     # )
     # odometry.start()
     odometry = OdometryData(
-        data_path="datasets/recorded/outdoor.pkl",
+        data_path="datasets/recorded/outdoor_zero.pkl",
         wall_clock=False,
         use_odometry=True
     )
@@ -116,7 +116,6 @@ def run_robot(args):
         calib=K,
         device=args.device,
         visualize=args.visualize,
-        use_backend=False
     )
     
     stop_event = threading.Event()

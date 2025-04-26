@@ -146,8 +146,8 @@ def run_backend(config, device, states, keyframes, main2backend, backend2main, K
             )
 
         with states.lock:
-            states.edges_ii[:] = factor_graph.ii.cpu().tolist()
-            states.edges_jj[:] = factor_graph.jj.cpu().tolist()
+            states.edges_ii[:] = factor_graph._ii_list
+            states.edges_jj[:] = factor_graph._jj_list
 
         if config["use_calib"]:
             factor_graph.solve_GN_calib()
@@ -188,7 +188,7 @@ class VIO:
 
         if self.multi_process:
             manager = mp.Manager()
-            self.keyframes = SharedKeyframes(manager, self.h, self.w, device=self.device)
+            self.keyframes = SharedKeyframes(manager, self.h, self.w)
             self.states = SharedStates(manager, self.h, self.w, device=self.device)
 
         else:
@@ -311,9 +311,10 @@ class VIO:
                 if odom_pose is not None and len(self.keyframes) > 1:
                     delta_T = self.last_odom_pose.inv() * odom_pose
                     # note, the new keyframe is already added to the keyframes list in tracker.py
-                    odom_factor = ([len(self.keyframes) - 2], [len(self.keyframes) - 1], delta_T.data)
+                    # _idx is the index of the last keyframe
+                    odom_factor = (self.keyframes.get_last_idx() - 1, self.keyframes.get_last_idx(), delta_T.data)
 
-                self.states.queue_global_optimization(len(self.keyframes) - 1, odom_factor)
+                self.states.queue_global_optimization(self.keyframes.get_last_idx(), odom_factor)
                 self.last_odom_pose = odom_pose
 
         self.frame_count += 1
