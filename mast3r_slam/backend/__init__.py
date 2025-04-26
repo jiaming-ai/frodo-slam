@@ -6,7 +6,6 @@ ROOT = os.path.dirname(__file__)
 src_dir = os.path.join(ROOT, "src")
 include_dirs = [os.path.join(ROOT, "include"), os.path.join(ROOT, "../../thirdparty/eigen")]
 
-# one‐time load on first import
 _backends = load(
     name="mast3r_slam_backends",
     sources=[

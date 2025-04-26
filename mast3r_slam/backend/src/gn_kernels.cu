@@ -59,8 +59,9 @@ class SparseBlock {
 
     Eigen::SparseMatrix<double> A;
     Eigen::VectorX<double> b;
+    int N, M;
 
-    SparseBlock(int N, int M) : N(N), M(M) {
+    SparseBlock(int n, int m) : N(n), M(m) {
       A = Eigen::SparseMatrix<double>(N*M, N*M);
       b = Eigen::VectorXd::Zero(N*M);
     }
@@ -87,12 +88,20 @@ class SparseBlock {
           for (int k=0; k<M; k++) {
             for (int l=0; l<M; l++) {
               double val = As_acc[n][k][l];
-              tripletList.push_back(T(M*i + k, M*j + l, val));
+              if (val != 0.0) {
+                tripletList.emplace_back(M*i + k, M*j + l, val);
+              }
             }
           }
         }
       }
-      A.setFromTriplets(tripletList.begin(), tripletList.end());
+      if (!tripletList.empty()) {
+        // build a tiny block and add it into A
+        Eigen::SparseMatrix<double> block(N*M, N*M);
+        block.setFromTriplets(tripletList.begin(), tripletList.end());
+        A += block;    // <—— accumulate
+      }
+
     }
 
     void update_rhs(torch::Tensor bs, torch::Tensor ii) {
@@ -129,32 +138,65 @@ class SparseBlock {
 
     }
 
+    // torch::Tensor solve(const float lm=0.0, const float ep=0.0) {
+
+    //   torch::Tensor dx;
+
+    //   Eigen::SparseMatrix<double> L(A);
+    //   L.diagonal().array() += ep + lm * L.diagonal().array();
+
+    //   Eigen::SimplicialLLT<Eigen::SparseMatrix<double>> solver;
+    //   solver.compute(L);
+
+    //   if (solver.info() == Eigen::Success) {
+    //     Eigen::VectorXd x = solver.solve(b);
+    //     dx = torch::from_blob(x.data(), {N, M}, torch::TensorOptions()
+    //       .dtype(torch::kFloat64)).to(torch::kCUDA).to(torch::kFloat32);
+    //   }
+    //   else {
+    //     dx = torch::zeros({N, M}, torch::TensorOptions()
+    //       .device(torch::kCUDA).dtype(torch::kFloat32));
+    //   }
+      
+    //   return dx;
+    // }
     torch::Tensor solve(const float lm=0.0, const float ep=0.0) {
-
       torch::Tensor dx;
-
-      Eigen::SparseMatrix<double> L(A);
+      Eigen::SparseMatrix<double> L(A); // Copy A.A
       L.diagonal().array() += ep + lm * L.diagonal().array();
+
+      std::cout << "  Solving system with N=" << N << ", M=" << M << ", Size=" << L.rows() << "x" << L.cols() << std::endl;
+      std::cout << "  Norm of b = " << b.norm() << std::endl;
+      std::cout << "  Matrix L non-zeros = " << L.nonZeros() << std::endl;
+      if (L.rows() > 0) {
+          std::cout << "  Matrix L diagonal min/max = " << L.diagonal().minCoeff() << "/" << L.diagonal().maxCoeff() << std::endl;
+      } else {
+            std::cerr << "  Warning: Matrix L is empty!" << std::endl;
+      }
+
 
       Eigen::SimplicialLLT<Eigen::SparseMatrix<double>> solver;
       solver.compute(L);
 
-      if (solver.info() == Eigen::Success) {
-        Eigen::VectorXd x = solver.solve(b);
-        dx = torch::from_blob(x.data(), {N, M}, torch::TensorOptions()
-          .dtype(torch::kFloat64)).to(torch::kCUDA).to(torch::kFloat32);
-      }
-      else {
-        dx = torch::zeros({N, M}, torch::TensorOptions()
-          .device(torch::kCUDA).dtype(torch::kFloat32));
-      }
-      
-      return dx;
-    }
+      Eigen::ComputationInfo solve_info = solver.info();
+      std::cout << "  Solver info after compute: " << solve_info << std::endl; // Eigen::Success = 0
 
-  private:
-    const int N;
-    const int M;
+      if (solve_info == Eigen::Success) {
+          Eigen::VectorXd x = solver.solve(b);
+          std::cout << "  Solve successful. Norm of x = " << x.norm() << std::endl;
+          // Check if x is numerically zero
+          if (x.norm() < 1e-12) {
+              std::cerr << "  Warning: Solver succeeded but solution norm is near zero." << std::endl;
+          }
+          dx = torch::from_blob(x.data(), {N, M}, torch::TensorOptions()
+            .dtype(torch::kFloat64)).clone().to(torch::kCUDA).to(torch::kFloat32); // Added .clone()
+      } else {
+          std::cerr << "  Eigen Solver FAILED with code: " << solve_info << std::endl;
+          dx = torch::zeros({N, M}, torch::TensorOptions()
+            .device(torch::kCUDA).dtype(torch::kFloat32));
+      }
+      return dx;
+  }
 
 };
 
@@ -672,10 +714,10 @@ __global__ void ray_align_kernel(
     const float ci = Cs[ix][ind_Xi][0];
     const float cj = Cs[jx][k][0];
     const bool valid = 
-      valid_match_ind
-      & (q > Q_thresh)
-      & (ci > C_thresh)
-      & (cj > C_thresh);
+    valid_match_ind
+    & (q > Q_thresh)
+    & (ci > C_thresh)
+    & (cj > C_thresh);
 
     // Weight using confidences
     const float conf_weight = q;
@@ -697,6 +739,12 @@ __global__ void ray_align_kernel(
     w[1] *= w_const_ray;
     w[2] *= w_const_ray;
     w[3] *= w_const_dist;
+
+    // // print the weights for debugging TODO: remove this
+    // if (block_id == 0) {
+    //   printf("err: %f, %f, %f, %f\n", err[0], err[1], err[2], err[3]);
+    //   printf("w: %f, %f, %f, %f\n", w[0], w[1], w[2], w[3]);
+    // }
  
     // Jacobians
     
@@ -928,11 +976,6 @@ std::vector<torch::Tensor> gauss_newton_rays_cuda(
     // NOTE: Accounting for negative here!
     dx = -A.solve();
 
-    //
-    // pose_retr_kernel_right<<<1, THREADS>>>(
-    //   Twc.packed_accessor32<float,2,torch::RestrictPtrTraits>(),
-    //   dx.packed_accessor32<float,2,torch::RestrictPtrTraits>(),
-    //   num_fix);
     pose_retr_kernel<<<1, THREADS>>>(
       Twc.packed_accessor32<float,2,torch::RestrictPtrTraits>(),
       dx.packed_accessor32<float,2,torch::RestrictPtrTraits>(),
@@ -951,30 +994,521 @@ std::vector<torch::Tensor> gauss_newton_rays_cuda(
   return {dx}; // For debugging
 }
 
+
+// helper functions
+// Vec to Skew-symmetric matrix
+__device__ void vec_to_skew(const float* v, float* M) {
+    M[0] = 0;    M[1] = -v[2]; M[2] = v[1];
+    M[3] = v[2]; M[4] = 0;    M[5] = -v[0];
+    M[6] = -v[1]; M[7] = v[0]; M[8] = 0;
+}
+
+// SO(3) logarithm map: Rotation matrix (row-major) to axis-angle vector
+__device__ void R_to_vec(const float* R, float* omega) {
+    float trace = R[0] + R[4] + R[8];
+    float cos_angle = 0.5f * (trace - 1.0f);
+    // Clamp to valid range for acos
+    cos_angle = fmaxf(-1.0f, fminf(1.0f, cos_angle));
+    float angle = acosf(cos_angle);
+
+    if (fabsf(angle) < 1e-6f) { // Near identity
+        omega[0] = 0.0f; omega[1] = 0.0f; omega[2] = 0.0f;
+    } else if (fabsf(angle - M_PI) < 1e-6f) { // Near 180 degrees
+       // More complex case, find axis - simplified here
+       // Find largest diagonal element to find axis component sign
+       if(R[0] > R[4] && R[0] > R[8]) { // xx largest
+            float s = 2.0f * sqrtf(R[0] - R[4] - R[8] + 1.0f);
+            omega[0] = 0.5f*s; omega[1] = (R[3]+R[1])/s; omega[2] = (R[2]+R[6])/s;
+       } else if (R[4] > R[8]) { // yy largest
+            float s = 2.0f * sqrtf(R[4] - R[0] - R[8] + 1.0f);
+            omega[0] = (R[3]+R[1])/s; omega[1] = 0.5f*s; omega[2] = (R[7]+R[5])/s;
+       } else { // zz largest
+            float s = 2.0f * sqrtf(R[8] - R[0] - R[4] + 1.0f);
+            omega[0] = (R[2]+R[6])/s; omega[1] = (R[7]+R[5])/s; omega[2] = 0.5f*s;
+       }
+       // Multiply by angle
+       omega[0] *= angle; omega[1] *= angle; omega[2] *= angle;
+
+    } else { // General case
+        float sin_angle = sinf(angle);
+        float factor = angle / (2.0f * sin_angle);
+        omega[0] = factor * (R[7] - R[5]);
+        omega[1] = factor * (R[2] - R[6]);
+        omega[2] = factor * (R[3] - R[1]);
+    }
+}
+
+// SE(3) Left Jacobian Inverse (J_l^{-1}) - Simplified
+__device__ void Jl_inv(const float* omega, float* J_inv) {
+    // J_inv is 3x3, assumes omega is axis-angle
+    float angle = sqrtf(omega[0]*omega[0] + omega[1]*omega[1] + omega[2]*omega[2]);
+    float omega_skew[9];
+    vec_to_skew(omega, omega_skew); // Row-major skew matrix
+
+    // Identity matrix
+    for(int i=0; i<9; ++i) J_inv[i] = (i%4 == 0) ? 1.0f : 0.0f;
+
+    if (fabsf(angle) < 1e-6f) {
+        // J_inv = I - 0.5*[omega]_x
+        for(int i=0; i<9; ++i) J_inv[i] -= 0.5f * omega_skew[i];
+    } else {
+        float angle_sq = angle * angle;
+        float sin_angle = sinf(angle);
+        float cos_angle = cosf(angle);
+        float factor1 = -0.5f;
+        float factor2 = (1.0f / angle_sq) - ((1.0f + cos_angle) / (2.0f * angle * sin_angle)); // Handle sin(angle)=0 case separately if needed
+
+        float omega_skew_sq[9]; // omega_skew * omega_skew
+        for(int r=0; r<3; ++r) {
+            for(int c=0; c<3; ++c) {
+                omega_skew_sq[r*3+c] = 0;
+                for(int k=0; k<3; ++k) omega_skew_sq[r*3+c] += omega_skew[r*3+k] * omega_skew[k*3+c];
+            }
+        }
+
+        for(int i=0; i<9; ++i) {
+            J_inv[i] += factor1 * omega_skew[i] + factor2 * omega_skew_sq[i];
+        }
+    }
+}
+
+// SE(3) logarithm: T=[R,t] -> [rho, phi]
+__device__ void logSE3(const float* R, const float* t, float* rho, float* phi) {
+    R_to_vec(R, phi); // phi is axis-angle vector
+    float J_inv[9]; // 3x3 row-major J_l^{-1}(phi)
+    Jl_inv(phi, J_inv);
+    // rho = J_inv * t
+    rho[0] = J_inv[0]*t[0] + J_inv[1]*t[1] + J_inv[2]*t[2];
+    rho[1] = J_inv[3]*t[0] + J_inv[4]*t[1] + J_inv[5]*t[2];
+    rho[2] = J_inv[6]*t[0] + J_inv[7]*t[1] + J_inv[8]*t[2];
+}
+
+// --- Matrix operations ---
+// Multiply 3x3 matrix A (row-major) by 3x1 vector x, output y=Ax
+__device__ void mat33_vec3_mult(const float* A, const float* x, float* y) {
+    y[0] = A[0]*x[0] + A[1]*x[1] + A[2]*x[2];
+    y[1] = A[3]*x[0] + A[4]*x[1] + A[5]*x[2];
+    y[2] = A[6]*x[0] + A[7]*x[1] + A[8]*x[2];
+}
+
+// Multiply 3x3 matrix A by 3x3 matrix B (both row-major), output C=AB
+__device__ void mat33_mat33_mult(const float* A, const float* B, float* C) {
+    for(int r=0; r<3; ++r) {
+        for(int c=0; c<3; ++c) {
+            C[r*3+c] = 0;
+            for(int k=0; k<3; ++k) {
+                C[r*3+c] += A[r*3+k] * B[k*3+c];
+            }
+        }
+    }
+}
+// --- Main Kernel (Left Perturbation, SE(3) Log Residual) ---
+__global__ void odom_constraint_kernel_left_perturb_log(
+    // Inputs
+    const torch::PackedTensorAccessor32<float,2,torch::RestrictPtrTraits> Twc,      // World poses (N, 8) [tx, ty, tz, qx, qy, qz, qw, s]
+    const torch::PackedTensorAccessor32<float,2,torch::RestrictPtrTraits> T_meas_ij_acc, // Measured SE(3) relative poses (num_odom, 7 or 8)
+    const torch::PackedTensorAccessor32<long,1,torch::RestrictPtrTraits> odom_ii,   // Indices i for odometry edges
+    const torch::PackedTensorAccessor32<long,1,torch::RestrictPtrTraits> odom_jj,   // Indices j for odometry edges
+    const float sigma_odom_t, const float sigma_odom_r,                             // Odometry std deviations (trans, rot)
+    // Outputs
+    torch::PackedTensorAccessor32<float,4,torch::RestrictPtrTraits> Hs_odom,        // Output Hessian blocks (4, num_odom, 7, 7)
+    torch::PackedTensorAccessor32<float,3,torch::RestrictPtrTraits> gs_odom         // Output Gradient blocks (2, num_odom, 7)
+) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int num_odom_edges = odom_ii.size(0);
+    if (idx >= num_odom_edges) return;
+
+    const int ix = static_cast<int>(odom_ii[idx]);
+    const int jx = static_cast<int>(odom_jj[idx]);
+
+    // --- Load Poses ---
+    float ti[3], qi[4], si[1];
+    float tj[3], qj[4], sj[1];
+    si[0] = Twc[ix][7]; for(int k=0; k<3; ++k) ti[k] = Twc[ix][k]; for(int k=0; k<4; ++k) qi[k] = Twc[ix][k+3];
+    sj[0] = Twc[jx][7]; for(int k=0; k<3; ++k) tj[k] = Twc[jx][k]; for(int k=0; k<4; ++k) qj[k] = Twc[jx][k+3];
+
+    // --- Load Measurement (SE3) ---
+    float t_m[3], q_m[4], R_m[9];
+    for(int k=0; k<3; ++k) t_m[k] = T_meas_ij_acc[idx][k];
+    for(int k=0; k<4; ++k) q_m[k] = T_meas_ij_acc[idx][k+3];
+    quat_to_rot(q_m, R_m); // Measurement rotation R_m (row-major)
+
+    // --- Precompute Transforms ---
+    float R_i[9], R_j[9], R_i_T[9], R_j_T[9];
+    quat_to_rot(qi, R_i); // R_i = R_wi
+    quat_to_rot(qj, R_j); // R_j = R_wj
+    // Transposes (Row Major)
+    R_i_T[0]=R_i[0]; R_i_T[1]=R_i[3]; R_i_T[2]=R_i[6]; R_i_T[3]=R_i[1]; R_i_T[4]=R_i[4]; R_i_T[5]=R_i[7]; R_i_T[6]=R_i[2]; R_i_T[7]=R_i[5]; R_i_T[8]=R_i[8];
+    R_j_T[0]=R_j[0]; R_j_T[1]=R_j[3]; R_j_T[2]=R_j[6]; R_j_T[3]=R_j[1]; R_j_T[4]=R_j[4]; R_j_T[5]=R_j[7]; R_j_T[6]=R_j[2]; R_j_T[7]=R_j[5]; R_j_T[8]=R_j[8];
+
+    // --- Compute Predicted SE(3) part T_pred_SE3 = [R_ij, t'_ij] ---
+    float R_ij[9];      // R_ij = R_i^T * R_j (Relative rotation)
+    mat33_mat33_mult(R_i_T, R_j, R_ij);
+    float t_diff[3] = {tj[0]-ti[0], tj[1]-ti[1], tj[2]-ti[2]};
+    float R_iT_tdiff[3];
+    mat33_vec3_mult(R_i_T, t_diff, R_iT_tdiff);
+    float t_pred_prime[3]; // t'_ij = (1/s_j) * R_i^T * (tj - ti)
+    float sj_inv = (sj[0] == 0.0f) ? 1e6f : 1.0f / sj[0]; // Avoid div by zero
+    t_pred_prime[0] = sj_inv * R_iT_tdiff[0];
+    t_pred_prime[1] = sj_inv * R_iT_tdiff[1];
+    t_pred_prime[2] = sj_inv * R_iT_tdiff[2];
+
+    // --- Compute Error Transformation T_err = T_meas^{-1} * T_pred_SE3 ---
+    // T_meas = [R_m, t_m] -> T_meas_inv = [R_m^T, -R_m^T t_m]
+    float R_m_T[9]; // Transpose R_m
+    R_m_T[0]=R_m[0]; R_m_T[1]=R_m[3]; R_m_T[2]=R_m[6]; R_m_T[3]=R_m[1]; R_m_T[4]=R_m[4]; R_m_T[5]=R_m[7]; R_m_T[6]=R_m[2]; R_m_T[7]=R_m[5]; R_m_T[8]=R_m[8];
+    float t_meas_inv[3];
+    mat33_vec3_mult(R_m_T, t_m, t_meas_inv);
+    t_meas_inv[0] *= -1.0f; t_meas_inv[1] *= -1.0f; t_meas_inv[2] *= -1.0f;
+
+    float R_err[9]; // R_err = R_m^T * R_ij
+    mat33_mat33_mult(R_m_T, R_ij, R_err);
+    float t_err[3]; // t_err = R_m^T * t_pred_prime + t_meas_inv
+    float Rm_T_tpred[3];
+    mat33_vec3_mult(R_m_T, t_pred_prime, Rm_T_tpred);
+    t_err[0] = Rm_T_tpred[0] + t_meas_inv[0];
+    t_err[1] = Rm_T_tpred[1] + t_meas_inv[1];
+    t_err[2] = Rm_T_tpred[2] + t_meas_inv[2];
+
+    // --- Compute Residual Vector r = log(T_err) ---
+    float r[6]; // [rho, phi]
+    float* rho = &r[0];
+    float* phi = &r[3];
+    logSE3(R_err, t_err, rho, phi);
+
+    // print rho and phi TODO: remove
+    // printf("Edge %d: rho = [%.3f, %.3f, %.3f], phi = [%.3f, %.3f, %.3f]\n", idx, rho[0], rho[1], rho[2], phi[0], phi[1], phi[2]);
+
+    // --- Compute Weights (Anisotropic) ---
+    float W[36] = {0}; // 6x6 diagonal weight matrix W = diag(info_t, info_t, info_t, info_r, info_r, info_r) * Huber
+    float info_t = 1.0f / (sigma_odom_t * sigma_odom_t);
+    float info_r = 1.0f / (sigma_odom_r * sigma_odom_r);
+    W[0]  = info_t * huber(r[0] / sigma_odom_t); // rho_x
+    W[7]  = info_t * huber(r[1] / sigma_odom_t); // rho_y
+    W[14] = info_t * huber(r[2] / sigma_odom_t); // rho_z
+    W[21] = info_r * huber(r[3] / sigma_odom_r); // phi_x
+    W[28] = info_r * huber(r[4] / sigma_odom_r); // phi_y
+    W[35] = info_r * huber(r[5] / sigma_odom_r); // phi_z
+
+    // --- Compute Jacobians (Left Perturbation, SE(3) Log approx + Scale) ---
+    // J is 6x14 = [ J_rho_i | J_phi_i | J_rho_j | J_phi_j ]
+    // J_i is 6x7, J_j is 6x7
+    // delta_x = [dt^w, dtheta^w, ds]
+    float J_i[42] = {0}; // 6x7 Jacobian w.r.t state i (row-major)
+    float J_j[42] = {0}; // 6x7 Jacobian w.r.t state j (row-major)
+
+    // Approx J based on Adjoint(T_j^-1) structure near r=0
+    float tj_inv[3]; // t part of T_j^{-1} = -R_j^T t_j
+    mat33_vec3_mult(R_j_T, tj, tj_inv);
+    tj_inv[0]*=-1.0; tj_inv[1]*=-1.0; tj_inv[2]*=-1.0;
+    float tj_inv_skew[9]; // [tj_inv]_x
+    vec_to_skew(tj_inv, tj_inv_skew);
+
+    // J_j: Approx Ad(T_j^-1)
+    // d_rho / d_tj^w = R_j^T
+    J_j[0] = R_j_T[0]; J_j[1] = R_j_T[1]; J_j[2] = R_j_T[2]; // Row 0
+    J_j[7] = R_j_T[3]; J_j[8] = R_j_T[4]; J_j[9] = R_j_T[5]; // Row 1
+    J_j[14]= R_j_T[6]; J_j[15]= R_j_T[7]; J_j[16]= R_j_T[8]; // Row 2
+    // d_rho / d_thetaj^w = [tj_inv]_x * R_j^T
+    float drho_dthetaj[9]; // 3x3 matrix
+    mat33_mat33_mult(tj_inv_skew, R_j_T, drho_dthetaj);
+    J_j[3] = drho_dthetaj[0]; J_j[4] = drho_dthetaj[1]; J_j[5] = drho_dthetaj[2]; // Row 0
+    J_j[10]= drho_dthetaj[3]; J_j[11]= drho_dthetaj[4]; J_j[12]= drho_dthetaj[5]; // Row 1
+    J_j[17]= drho_dthetaj[6]; J_j[18]= drho_dthetaj[7]; J_j[19]= drho_dthetaj[8]; // Row 2
+    // d_phi / d_thetaj^w = R_j^T
+    J_j[24]= R_j_T[0]; J_j[25]= R_j_T[1]; J_j[26]= R_j_T[2]; // Row 3
+    J_j[31]= R_j_T[3]; J_j[32]= R_j_T[4]; J_j[33]= R_j_T[5]; // Row 4
+    J_j[38]= R_j_T[6]; J_j[39]= R_j_T[7]; J_j[40]= R_j_T[8]; // Row 5
+    // d_rho / d_sj = -R_m^T * t'_ij (Approximation)
+    float drho_dsj[3];
+    mat33_vec3_mult(R_m_T, t_pred_prime, drho_dsj);
+    J_j[6] = -drho_dsj[0];  // Row 0, Col 6
+    J_j[13]= -drho_dsj[1];  // Row 1, Col 6
+    J_j[20]= -drho_dsj[2];  // Row 2, Col 6
+
+    // J_i: Approx -Ad(T_j^-1)
+    for(int k=0; k<42; ++k) J_i[k] = -J_j[k]; // Negate most terms
+    // Override d_rho / d_si = 0 (Approximation)
+    J_i[6] = 0.0; J_i[13] = 0.0; J_i[20] = 0.0;
+    // Override d_phi / d_si = 0
+    J_i[27]= 0.0; J_i[34] = 0.0; J_i[41] = 0.0;
+
+    // --- Accumulate H and g ---
+    // H = J^T W J, g = J^T W r
+    float J[84]; // Combined Jacobian 6x14 = [J_i | J_j] (Row Major)
+    for(int r=0; r<6; ++r) { for(int c=0; c<7; ++c) J[r*14+c] = J_i[r*7+c]; }
+    for(int r=0; r<6; ++r) { for(int c=0; c<7; ++c) J[r*14+(c+7)] = J_j[r*7+c]; }
+
+    float J_T_W[84*6] = {0}; // J^T (14x6) * W (6x6) -> (14x6)
+    for(int r_jt=0; r_jt<14; ++r_jt) {
+        for(int c_w=0; c_w<6; ++c_w) {
+            // (r_jt, c_w) element of J^T * W
+            // = sum_k J^T(r_jt, k) * W(k, c_w)
+            // = sum_k J(k, r_jt) * W(k, c_w) (W is diagonal)
+             J_T_W[r_jt*6 + c_w] = J[c_w*14 + r_jt] * W[c_w*6 + c_w];
+        }
+    }
+
+    float H_full[196] = {0}; // Full 14x14 Hessian block H = (J^T W) * J
+    for(int r_h=0; r_h<14; ++r_h) {
+        for(int c_j=0; c_j<14; ++c_j) {
+            // (r_h, c_j) element of H
+            // = sum_k (J^T W)(r_h, k) * J(k, c_j)
+            float val = 0;
+            for(int k=0; k<6; ++k) {
+                val += J_T_W[r_h*6 + k] * J[k*14 + c_j];
+            }
+            H_full[r_h*14 + c_j] = val;
+        }
+    }
+
+    float g_full[14] = {0}; // Full 14x1 gradient block g = (J^T W) * r
+    for(int r_jt=0; r_jt<14; ++r_jt) {
+        // (r_jt) element of g
+        // = sum_k (J^T W)(r_jt, k) * r(k)
+        float val = 0;
+        for(int k=0; k<6; ++k) {
+            val += J_T_W[r_jt*6 + k] * r[k];
+        }
+        g_full[r_jt] = val;
+    }
+
+    // --- Write results to Global Memory ---
+    // Split g into g_i, g_j
+    for (int n = 0; n < 7; ++n) gs_odom[0][idx][n] = g_full[n];     // g_i
+    for (int n = 0; n < 7; ++n) gs_odom[1][idx][n] = g_full[n + 7]; // g_j
+    // Unpack H into H_ii, H_ij, H_ji, H_jj
+    for (int r = 0; r < 7; ++r) { for (int c = 0; c < 7; ++c) Hs_odom[0][idx][r][c] = H_full[r*14 + c]; }         // H_ii
+    for (int r = 0; r < 7; ++r) { for (int c = 0; c < 7; ++c) Hs_odom[1][idx][r][c] = H_full[r*14 + (c + 7)]; }   // H_ij
+    for (int r = 0; r < 7; ++r) { for (int c = 0; c < 7; ++c) Hs_odom[2][idx][r][c] = H_full[(r + 7)*14 + c]; }   // H_ji
+    for (int r = 0; r < 7; ++r) { for (int c = 0; c < 7; ++c) Hs_odom[3][idx][r][c] = H_full[(r + 7)*14 + (c + 7)]; } // H_jj
+
+} // end of kernel
+
+
+// --- Main CUDA Kernel (Left Perturbation) ---
+__global__ void odom_constraint_kernel_left_perturb(
+    // Inputs
+    const torch::PackedTensorAccessor32<float,2,torch::RestrictPtrTraits> Twc,      // World poses (N, 8) [tx, ty, tz, qx, qy, qz, qw, s]
+    const torch::PackedTensorAccessor32<float,2,torch::RestrictPtrTraits> T_meas_ij, // Measured SE(3) relative poses (num_odom, 8/7 - uses first 7)
+    const torch::PackedTensorAccessor32<long,1,torch::RestrictPtrTraits> odom_ii,   // Indices i for odometry edges
+    const torch::PackedTensorAccessor32<long,1,torch::RestrictPtrTraits> odom_jj,   // Indices j for odometry edges
+    const float sigma_odom,                                                       // Odometry standard deviation (scalar, for Huber)
+    // Outputs
+    torch::PackedTensorAccessor32<float,4,torch::RestrictPtrTraits> Hs_odom,        // Output Hessian blocks (4, num_odom, 7, 7)
+    torch::PackedTensorAccessor32<float,3,torch::RestrictPtrTraits> gs_odom         // Output Gradient blocks (2, num_odom, 7)
+) {
+    // --- Thread Indexing ---
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int num_odom_edges = odom_ii.size(0);
+    if (idx >= num_odom_edges) return;
+
+    // --- Get Pose Indices ---
+    const int ix = static_cast<int>(odom_ii[idx]);
+    const int jx = static_cast<int>(odom_jj[idx]);
+
+    // --- Load Poses and Measurement into Local Variables (Registers) ---
+    float ti[3], qi[4], si[1];
+    float tj[3], qj[4], sj[1];
+    float t_meas_ij[3], q_meas_ij[4]; // s_meas_ij is ignored for SE(3) measurements
+
+    // Load pose i (World frame T_wi)
+    si[0] = Twc[ix][7];
+    for(int k=0; k<3; ++k) ti[k] = Twc[ix][k];
+    for(int k=0; k<4; ++k) qi[k] = Twc[ix][k+3];
+
+    // Load pose j (World frame T_wj)
+    sj[0] = Twc[jx][7];
+    for(int k=0; k<3; ++k) tj[k] = Twc[jx][k];
+    for(int k=0; k<4; ++k) qj[k] = Twc[jx][k+3];
+
+    // Load SE(3) measurement T_meas_ij (Relative pose j in i's frame)
+    for(int k=0; k<3; ++k) t_meas_ij[k] = T_meas_ij[idx][k];
+    for(int k=0; k<4; ++k) q_meas_ij[k] = T_meas_ij[idx][k+3];
+
+    // --- Compute Estimated Relative Transformation T_ij = T_i^{-1} * T_j ---
+    float tij[3], qij[4], sij[1];
+    // relSim3 calculates T_ij = T_wi^{-1} * T_wj
+    // tij = (1/si) * Ri^T * (tj - ti)
+    // qij = qi^{-1} * qj
+    // sij = sj / si
+    relSim3(ti, qi, si, tj, qj, sj, tij, qij, sij);
+
+    // --- Compute Residuals (Simplified) ---
+    float err[6]; // [err_tx, err_ty, err_tz, err_rx, err_ry, err_rz]
+
+    // Translation residual: e_t = t_ij - t_meas_ij
+    for (int k = 0; k < 3; k++) {
+        err[k] = tij[k] - t_meas_ij[k];
+    }
+
+    // Rotation residual: e_r approx 2 * vec(q_ij * q_meas_ij^{-1})
+    float q_meas_ij_inv[4];
+    quat_inv(q_meas_ij, q_meas_ij_inv);
+    float q_err[4]; // q_err = q_ij * q_meas_ij_inv
+    quat_comp(qij, q_meas_ij_inv, q_err);
+    if (q_err[3] < 0.0f) { // Ensure canonical quaternion for vec approx
+       q_err[0] *= -1.0f; q_err[1] *= -1.0f; q_err[2] *= -1.0f; q_err[3] *= -1.0f;
+    }
+    err[3] = 2.0f * q_err[0]; err[4] = 2.0f * q_err[1]; err[5] = 2.0f * q_err[2];
+
+    // print the error, TODO: remove this
+    printf("err for edge %d: %f, %f, %f, %f, %f, %f\n", idx, err[0], err[1], err[2], err[3], err[4], err[5]);
+    // --- Compute Weights ---
+    float w[6];
+    const float sigma_odom_inv = 1.0f / sigma_odom;
+    const float info = sigma_odom_inv * sigma_odom_inv;
+    for (int k = 0; k < 6; k++) {
+        w[k] = info * huber(err[k] * sigma_odom_inv);
+    }
+
+    // --- Precomputations for Jacobians (Left Perturbation) ---
+    float R_i[9];       // R_wi (world from body_i), Row Major
+    float R_j[9];       // R_wj (world from body_j), Row Major
+    float R_i_T[9];     // R_iw (body_i from world), Row Major
+    float R_j_T[9];     // R_jw (body_j from world), Row Major
+    float si_inv = 1.0f / si[0];
+    float tij_x = tij[0], tij_y = tij[1], tij_z = tij[2]; // Cache components
+
+    quat_to_rot(qi, R_i); // R_i is R_wi (row-major)
+    quat_to_rot(qj, R_j); // R_j is R_wj (row-major)
+
+    // Compute R_i^T (Row Major)
+    R_i_T[0] = R_i[0]; R_i_T[1] = R_i[3]; R_i_T[2] = R_i[6]; // Col 0 -> Row 0
+    R_i_T[3] = R_i[1]; R_i_T[4] = R_i[4]; R_i_T[5] = R_i[7]; // Col 1 -> Row 1
+    R_i_T[6] = R_i[2]; R_i_T[7] = R_i[5]; R_i_T[8] = R_i[8]; // Col 2 -> Row 2
+
+    // Compute R_j^T (Row Major)
+    R_j_T[0] = R_j[0]; R_j_T[1] = R_j[3]; R_j_T[2] = R_j[6]; // Col 0 -> Row 0
+    R_j_T[3] = R_j[1]; R_j_T[4] = R_j[4]; R_j_T[5] = R_j[7]; // Col 1 -> Row 1
+    R_j_T[6] = R_j[2]; R_j_T[7] = R_j[5]; R_j_T[8] = R_j[8]; // Col 2 -> Row 2
+
+
+    // --- Compute Jacobians and Accumulate H/g ---
+    // Using Left Perturbation delta_x = [dt^world, dtheta^world, ds]
+    float Jx[14]; float* Ji = &Jx[0]; float* Jj = &Jx[7]; // Combined Jacobian J = [Ji | Jj]
+    const int h_dim = 105; float hij[h_dim]; // Stores upper triangle of H = J^T W J
+    float vi[7], vj[7]; // Stores components of g = J^T W err
+    for (int l = 0; l < h_dim; ++l) hij[l] = 0.0f;
+    for (int n = 0; n < 7; ++n) { vi[n] = 0.0f; vj[n] = 0.0f; }
+
+    // --- Process Translation Residuals (k=0, 1, 2 for err_t[x,y,z]) ---
+    for (int k = 0; k < 3; ++k) { // Loop over residual components err[0], err[1], err[2]
+        for (int n = 0; n < 7; ++n) { Ji[n] = 0.0f; Jj[n] = 0.0f; } // Clear Jacobians
+
+        // Jacobian Jj (w.r.t delta_x_j = [dt_j^w, dtheta_j^w, ds_j])
+        // ∂err_t[k] / ∂delta_t_j^w = ( (1/s_i) * R_i^T )_row_k
+        Jj[0] = si_inv * R_i_T[k*3 + 0]; // k-th row, 0-th col
+        Jj[1] = si_inv * R_i_T[k*3 + 1]; // k-th row, 1-st col
+        Jj[2] = si_inv * R_i_T[k*3 + 2]; // k-th row, 2-nd col
+        // Other derivatives are 0
+        Jj[3] = 0.0f; Jj[4] = 0.0f; Jj[5] = 0.0f; Jj[6] = 0.0f;
+
+        // Jacobian Ji (w.r.t delta_x_i = [dt_i^w, dtheta_i^w, ds_i])
+        // ∂err_t[k] / ∂delta_t_i^w = -( (1/s_i) * R_i^T )_row_k
+        Ji[0] = -si_inv * R_i_T[k*3 + 0]; // k-th row, 0-th col
+        Ji[1] = -si_inv * R_i_T[k*3 + 1]; // k-th row, 1-st col
+        Ji[2] = -si_inv * R_i_T[k*3 + 2]; // k-th row, 2-nd col
+        // ∂err_t[k] / ∂delta_theta_i^w = ( [t_ij]_x * R_i^T )_row_k
+        // temp_vec = R_i^T * delta_theta_i^w
+        // result = [t_ij]_x * temp_vec
+        // Need k-th row of the matrix [t_ij]_x * R_i^T
+        float mat_row[3]; // Row k of the 3x3 matrix [t_ij]_x * R_i^T
+        mat_row[0] = (k == 1) * tij_z * R_i_T[0*3+0] - (k == 2) * tij_y * R_i_T[0*3+0]  // Row k, Col 0 of [t]_x * R^T
+                   + (k == 1) * tij_z * R_i_T[1*3+0] - (k == 2) * tij_y * R_i_T[1*3+0]
+                   + (k == 1) * tij_z * R_i_T[2*3+0] - (k == 2) * tij_y * R_i_T[2*3+0]; // Simplified: This is complex. Let's compute row k of [t_ij]_x first
+        float tij_x_row_k[3];
+        tij_x_row_k[0] = (k == 1) * tij_z - (k == 2) * tij_y; // Row k, Col 0 of [t_ij]_x
+        tij_x_row_k[1] = (k == 2) * tij_x - (k == 0) * tij_z; // Row k, Col 1 of [t_ij]_x
+        tij_x_row_k[2] = (k == 0) * tij_y - (k == 1) * tij_x; // Row k, Col 2 of [t_ij]_x
+        // Now dot product with columns of R_i^T (which are rows of R_i)
+        Ji[3] = tij_x_row_k[0] * R_i_T[0*3+0] + tij_x_row_k[1] * R_i_T[1*3+0] + tij_x_row_k[2] * R_i_T[2*3+0]; // Dot row k of [t]_x with col 0 of R_i^T
+        Ji[4] = tij_x_row_k[0] * R_i_T[0*3+1] + tij_x_row_k[1] * R_i_T[1*3+1] + tij_x_row_k[2] * R_i_T[2*3+1]; // Dot row k of [t]_x with col 1 of R_i^T
+        Ji[5] = tij_x_row_k[0] * R_i_T[0*3+2] + tij_x_row_k[1] * R_i_T[1*3+2] + tij_x_row_k[2] * R_i_T[2*3+2]; // Dot row k of [t]_x with col 2 of R_i^T
+        // ∂err_t[k] / ∂delta_s_i = -t_ij[k]
+        Ji[6] = -tij[k];
+
+        // Accumulate H += J^T * w[k] * J and g += J^T * w[k] * err[k]
+        float weight = w[k]; float error = err[k]; int l = 0;
+        for (int n = 0; n < 14; ++n) { for (int m = 0; m <= n; ++m) { hij[l] += weight * Jx[n] * Jx[m]; l++; } }
+        float weighted_error = weight * error;
+        for (int n = 0; n < 7; ++n) { vi[n] += weighted_error * Ji[n]; }
+        for (int n = 0; n < 7; ++n) { vj[n] += weighted_error * Jj[n]; }
+    }
+
+    // --- Process Rotation Residuals (k=3, 4, 5 for err_r[x,y,z]) ---
+    // Using Left Perturbation Model Approximations: J_theta_i = -R_j^T, J_theta_j = R_j^T
+    for (int k = 0; k < 3; ++k) { // Loop over residual components err[3], err[4], err[5]
+        for (int n = 0; n < 7; ++n) { Ji[n] = 0.0f; Jj[n] = 0.0f; } // Clear Jacobians
+
+        // Jacobian Jj (w.r.t delta_x_j = [dt_j^w, dtheta_j^w, ds_j])
+        // ∂err_r[k] / ∂delta_theta_j^w[xyz] ≈ (R_j^T)_row_k
+        Jj[3] = R_j_T[k*3 + 0]; // k-th row, 0-th col
+        Jj[4] = R_j_T[k*3 + 1]; // k-th row, 1-st col
+        Jj[5] = R_j_T[k*3 + 2]; // k-th row, 2-nd col
+
+        // Jacobian Ji (w.r.t delta_x_i = [dt_i^w, dtheta_i^w, ds_i])
+        // ∂err_r[k] / ∂delta_theta_i^w[xyz] ≈ -(R_j^T)_row_k
+        Ji[3] = -R_j_T[k*3 + 0]; // k-th row, 0-th col
+        Ji[4] = -R_j_T[k*3 + 1]; // k-th row, 1-st col
+        Ji[5] = -R_j_T[k*3 + 2]; // k-th row, 2-nd col
+
+        // Accumulate H/g
+        int residual_idx = k + 3;
+        float weight = w[residual_idx]; float error = err[residual_idx]; int l = 0;
+        for (int n = 0; n < 14; ++n) { for (int m = 0; m <= n; ++m) { hij[l] += weight * Jx[n] * Jx[m]; l++; } }
+        float weighted_error = weight * error;
+        for (int n = 0; n < 7; ++n) { vi[n] += weighted_error * Ji[n]; }
+        for (int n = 0; n < 7; ++n) { vj[n] += weighted_error * Jj[n]; }
+    }
+
+    // --- Write results directly to Global Memory ---
+    int l = 0;
+    for (int n = 0; n < 7; ++n) {
+         gs_odom[0][idx][n] = vi[n]; // g_i
+         gs_odom[1][idx][n] = vj[n]; // g_j
+    }
+    l = 0;
+    for (int n = 0; n < 14; ++n) { for (int m = 0; m <= n; ++m) {
+            float val = hij[l];
+            if (n < 7) { // Row i
+                if (m < 7) { // Col i -> H_ii
+                    Hs_odom[0][idx][n][m] = val; if (n != m) Hs_odom[0][idx][m][n] = val;
+                } else { // Col j -> H_ij / H_ji
+                    Hs_odom[1][idx][n][m - 7] = val; Hs_odom[2][idx][m - 7][n] = val;
+                }
+            } else { // Row j
+                 if (m >= 7) { // Col j -> H_jj
+                    Hs_odom[3][idx][n - 7][m - 7] = val; if (n != m) Hs_odom[3][idx][m - 7][n - 7] = val;
+                }
+            } l++; } }
+} // end of kernel
+
+
 __global__ void odom_constraint_kernel(
     // Inputs
     const torch::PackedTensorAccessor32<float,2,torch::RestrictPtrTraits> Twc,      // World poses (N, 8) [tx, ty, tz, qx, qy, qz, qw, s]
-    const torch::PackedTensorAccessor32<float,2,torch::RestrictPtrTraits> T_meas_ij, // Measured relative poses (num_odom, 8)
+    const torch::PackedTensorAccessor32<float,2,torch::RestrictPtrTraits> T_meas_ij, // Measured SE(3) relative poses (num_odom, 8/7 - uses first 7)
     const torch::PackedTensorAccessor32<long,1,torch::RestrictPtrTraits> odom_ii,   // Indices i for odometry edges
     const torch::PackedTensorAccessor32<long,1,torch::RestrictPtrTraits> odom_jj,   // Indices j for odometry edges
-    const float sigma_odom,                                                       // Odometry standard deviation (scalar)
+    const float sigma_odom,                                                       // Odometry standard deviation (scalar, for Huber)
     // Outputs
     torch::PackedTensorAccessor32<float,4,torch::RestrictPtrTraits> Hs,             // Output Hessian blocks (4, num_odom, 7, 7)
     torch::PackedTensorAccessor32<float,3,torch::RestrictPtrTraits> gs              // Output Gradient blocks (2, num_odom, 7)
 ) {
     // --- Thread Indexing ---
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-
-    if (idx >= odom_ii.size(0)) return;
+    const int num_odom_edges = odom_ii.size(0);
+    if (idx >= num_odom_edges) return;
 
     // --- Get Pose Indices ---
-    int ix = static_cast<int>(odom_ii[idx]);
-    int jx = static_cast<int>(odom_jj[idx]);
+    const int ix = static_cast<int>(odom_ii[idx]);
+    const int jx = static_cast<int>(odom_jj[idx]);
 
     // --- Load Poses and Measurement into Local Variables (Registers) ---
     float ti[3], qi[4], si[1];
     float tj[3], qj[4], sj[1];
-    float t_meas_ij[3], q_meas_ij[4], s_meas_ij[1];
+    float t_meas_ij[3], q_meas_ij[4]; // s_meas_ij is ignored for SE(3) measurements
 
     // Load pose i (World frame)
     si[0] = Twc[ix][7];
@@ -986,131 +1520,273 @@ __global__ void odom_constraint_kernel(
     for(int k=0; k<3; ++k) tj[k] = Twc[jx][k];
     for(int k=0; k<4; ++k) qj[k] = Twc[jx][k+3];
 
-    // Load measurement T_meas_ij (Relative pose j in i's frame)
-    s_meas_ij[0] = T_meas_ij[idx][7];
+    // Load SE(3) measurement T_meas_ij (Relative pose j in i's frame)
     for(int k=0; k<3; ++k) t_meas_ij[k] = T_meas_ij[idx][k];
     for(int k=0; k<4; ++k) q_meas_ij[k] = T_meas_ij[idx][k+3];
-
-    // --- Precomputations ---
-    float R_i[9];  // Rotation matrix for pose i (world to body_i), Column Major
-    float d[3];    // World frame difference: t_j - t_i (Needed for Right Perturbation Jacobian)
-
-    quat_to_rot(qi, R_i); // R_i is column-major storage for R_wb(i)
-    for(int k=0; k<3; ++k) d[k] = tj[k] - ti[k]; // d = tj - ti
+    // Ignore T_meas_ij[idx][7] as it's an SE(3) measurement
 
     // --- Compute Estimated Relative Transformation T_ij = T_i^{-1} * T_j ---
     float tij[3], qij[4], sij[1];
-    relSim3(ti, qi, si, tj, qj, sj, tij, qij, sij);
+    relSim3(ti, qi, si, tj, qj, sj, tij, qij, sij); // tij is (1/si)*Ri^T*(tj-ti)
 
     // --- Compute Residuals ---
-    float err[7]; // [err_tx, err_ty, err_tz, err_rx, err_ry, err_rz, err_s]
-    // Translation residual: e_t = t_ij - t_meas_ij
-    for (int k = 0; k < 3; k++) err[k] = tij[k] - t_meas_ij[k];
-    // Rotation residual: e_r approx 2 * vec(q_ij * q_meas_ij^{-1})
-    float q_meas_ij_inv[4]; quat_inv(q_meas_ij, q_meas_ij_inv);
-    float q_err[4]; quat_comp(qij, q_meas_ij_inv, q_err);
-    err[3] = 2.0f * q_err[0]; err[4] = 2.0f * q_err[1]; err[5] = 2.0f * q_err[2];
-    if (q_err[3] < 0.0f) { err[3] *= -1.0f; err[4] *= -1.0f; err[5] *= -1.0f; }
-    // Scale residual: e_s = log(s_ij / s_meas_ij)
-    err[6] = logf(sij[0] / s_meas_ij[0]);
+    float err[6]; // [err_tx, err_ty, err_tz, err_rx, err_ry, err_rz]
+
+    // Translation residual (Simplified): e_t = t_ij - t_meas_ij
+    for (int k = 0; k < 3; k++) {
+        err[k] = tij[k] - t_meas_ij[k];
+    }
+
+    // Rotation residual (Approximation): e_r approx 2 * vec(q_ij * q_meas_ij^{-1})
+    float q_meas_ij_inv[4];
+    quat_inv(q_meas_ij, q_meas_ij_inv);
+    float q_err[4]; // q_err = q_ij * q_meas_ij_inv
+    quat_comp(qij, q_meas_ij_inv, q_err);
+    // Ensure scalar part is positive for stability of vec approx
+    if (q_err[3] < 0.0f) {
+       q_err[0] *= -1.0f; q_err[1] *= -1.0f; q_err[2] *= -1.0f; q_err[3] *= -1.0f;
+    }
+    err[3] = 2.0f * q_err[0]; // 2 * qx_err
+    err[4] = 2.0f * q_err[1]; // 2 * qy_err
+    err[5] = 2.0f * q_err[2]; // 2 * qz_err
+
+    // Scale residual is ignored for SE(3) measurements.
 
     // --- Compute Weights ---
-    float w[7];   // Robust weights: w_k = Info * huber_weight_k
-    const float sigma_odom_inv_sq = 1.0f / (sigma_odom * sigma_odom);
-    const float sqrt_info = 1.0f / sigma_odom;
-    for (int k = 0; k < 7; k++) {
-        float weighted_err = sqrt_info * err[k];
-        w[k] = sigma_odom_inv_sq * huber(weighted_err);
+    float w[6];   // Robust weights: w_k = Info * huber_weight_k
+    const float sigma_odom_inv = 1.0f / sigma_odom;
+    const float info = sigma_odom_inv * sigma_odom_inv; // Information = 1 / sigma^2
+    for (int k = 0; k < 6; k++) {
+        // Use normalized error for Huber function
+        w[k] = info * huber(err[k] * sigma_odom_inv);
+    }
+
+    // --- Precomputations for Jacobians (using Right Perturbation) ---
+    float R_i[9];       // R_wi (world from body_i), Row Major
+    float R_j[9];       // R_wj (world from body_j), Row Major
+    float R_ij[9];      // R_ji (body_j from body_i) = Ri^T * Rj, Row Major
+    float s_ij = sj[0] / si[0]; // Relative scale s_j / s_i
+    float tij_x = tij[0], tij_y = tij[1], tij_z = tij[2]; // Cache components
+
+    quat_to_rot(qi, R_i); // R_i = R_wi (row-major)
+    quat_to_rot(qj, R_j); // R_j = R_wj (row-major)
+
+    // Compute R_ij = R_i^T * R_j (Row Major)
+    // R_ij[row, col] = sum_k (R_i_T[row, k] * R_j[k, col])
+    // R_ij[row, col] = sum_k (R_i[k, row] * R_j[k, col])
+    for(int row = 0; row < 3; ++row) {
+        for(int col = 0; col < 3; ++col) {
+            R_ij[row*3 + col] = 0.0f;
+            for(int k = 0; k < 3; ++k) {
+                // Access R_i[k, row] from row-major R_i[k*3 + row]
+                // Access R_j[k, col] from row-major R_j[k*3 + col]
+                R_ij[row*3 + col] += R_i[k*3 + row] * R_j[k*3 + col];
+            }
+        }
     }
 
     // --- Compute Jacobians and Accumulate H/g ---
-    float Jx[14]; float* Ji = &Jx[0]; float* Jj = &Jx[7];
-    const int h_dim = 105; float hij[h_dim]; // 14*(14+1)/2 = 105
-    float vi[7], vj[7];
+    // Using Right Perturbation delta_x = [dt^body, dtheta^body, ds]
+    float Jx[14]; float* Ji = &Jx[0]; float* Jj = &Jx[7]; // Combined Jacobian J = [Ji | Jj]
+    const int h_dim = 105; // 14*(14+1)/2 = 105
+    float hij[h_dim]; // Stores upper triangle of H = J^T W J
+    float vi[7], vj[7]; // Stores components of g = J^T W err
     for (int l = 0; l < h_dim; ++l) hij[l] = 0.0f;
     for (int n = 0; n < 7; ++n) { vi[n] = 0.0f; vj[n] = 0.0f; }
 
-    // --- Process Translation Residuals (k=0, 1, 2 for err[0], err[1], err[2]) ---
-    for (int k = 0; k < 3; ++k) {
-        for (int n = 0; n < 7; ++n) { Ji[n] = 0.0f; Jj[n] = 0.0f; } // Clear Jacobians
+    // --- Process Translation Residuals (k=0, 1, 2 for err_t[x,y,z]) ---
+    for (int k = 0; k < 3; ++k) { // Loop over residual components err[0], err[1], err[2]
+        for (int n = 0; n < 7; ++n) { Ji[n] = 0.0f; Jj[n] = 0.0f; } // Clear Jacobians for this residual component
 
-        // Derivatives of err_t[k] w.r.t delta_xi^R, delta_xj^R (RIGHT Perturbation)
-        float common_scale = 1.0f / si[0];
-
-        // ∂err_t[k] / ∂delta_t_i^R = -(1/s_i) * R_i^T_row_k
-        Ji[0] = -common_scale * R_i[0 * 3 + k];
-        Ji[1] = -common_scale * R_i[1 * 3 + k];
-        Ji[2] = -common_scale * R_i[2 * 3 + k];
-
-        // ∂err_t[k] / ∂delta_t_j^R = (1/s_i) * R_i^T_row_k
-        Jj[0] = common_scale * R_i[0 * 3 + k];
-        Jj[1] = common_scale * R_i[1 * 3 + k];
-        Jj[2] = common_scale * R_i[2 * 3 + k];
-
-        // ∂err_t[k] / ∂delta_theta_i^R = (1/s_i) * [R_i^T * skew(d)]_row_k
-        Ji[3] = common_scale * (R_i[1 * 3 + k] * d[2] - R_i[2 * 3 + k] * d[1]);
-        Ji[4] = common_scale * (R_i[2 * 3 + k] * d[0] - R_i[0 * 3 + k] * d[2]);
-        Ji[5] = common_scale * (R_i[0 * 3 + k] * d[1] - R_i[1 * 3 + k] * d[0]);
-
-        // ∂err_t[k] / ∂delta_s_i^R = -(1/s_i) * (R_i^T * d)[k]
-        Ji[6] = -common_scale * (R_i[0 * 3 + k] * d[0] + R_i[1 * 3 + k] * d[1] + R_i[2 * 3 + k] * d[2]);
-
-        // ∂err_t[k] / ∂delta_theta_j^R = 0 (For Right Perturbation)
-        Jj[3] = 0.0f;
-        Jj[4] = 0.0f;
-        Jj[5] = 0.0f;
-
-        // ∂err_t[k] / ∂delta_s_j^R = 0 (For Right Perturbation)
+        // Jacobian Jj (w.r.t delta_x_j = [dt_j^b, dtheta_j^b, ds_j])
+        // ∂err_t[k] / ∂delta_t_j^b = (s_ij * R_ij)_row_k
+        Jj[0] = s_ij * R_ij[k*3 + 0]; // k-th row, 0-th col of s_ij*R_ij
+        Jj[1] = s_ij * R_ij[k*3 + 1]; // k-th row, 1-st col of s_ij*R_ij
+        Jj[2] = s_ij * R_ij[k*3 + 2]; // k-th row, 2-nd col of s_ij*R_ij
+        // ∂err_t[k] / ∂delta_theta_j^b = 0
+        Jj[3] = 0.0f; Jj[4] = 0.0f; Jj[5] = 0.0f;
+        // ∂err_t[k] / ∂delta_s_j = 0
         Jj[6] = 0.0f;
+
+        // Jacobian Ji (w.r.t delta_x_i = [dt_i^b, dtheta_i^b, ds_i])
+        // ∂err_t[k] / ∂delta_t_i^b = -I_row_k
+        Ji[0] = (k == 0) ? -1.0f : 0.0f;
+        Ji[1] = (k == 1) ? -1.0f : 0.0f;
+        Ji[2] = (k == 2) ? -1.0f : 0.0f;
+        // ∂err_t[k] / ∂delta_theta_i^b = [t_ij]_x_row_k
+        Ji[3] = (k == 1) * tij_z - (k == 2) * tij_y; // Row k, Col 0 of [t_ij]_x
+        Ji[4] = (k == 2) * tij_x - (k == 0) * tij_z; // Row k, Col 1 of [t_ij]_x
+        Ji[5] = (k == 0) * tij_y - (k == 1) * tij_x; // Row k, Col 2 of [t_ij]_x
+        // ∂err_t[k] / ∂delta_s_i = -t_ij[k]
+        Ji[6] = -tij[k];
 
         // Accumulate H += J^T * w[k] * J and g += J^T * w[k] * err[k]
         float weight = w[k]; float error = err[k]; int l = 0;
-        for (int n = 0; n < 14; ++n) { for (int m = 0; m <= n; ++m) { hij[l] += weight * Jx[n] * Jx[m]; l++; } }
-        for (int n = 0; n < 7; ++n) { vi[n] += weight * error * Ji[n]; vj[n] += weight * error * Jj[n]; }
+        // H = J^T * W * J -> hij stores upper triangle of H
+        for (int n = 0; n < 14; ++n) { // Row index of J^T (col index of J)
+            for (int m = 0; m <= n; ++m) { // Col index of J^T (row index of J)
+                 // Accumulate Jx[n] * weight * Jx[m]
+                 hij[l] += weight * Jx[n] * Jx[m];
+                 l++;
+            }
+        }
+        // g = J^T * W * err -> vi/vj store components of g
+        float weighted_error = weight * error;
+        for (int n = 0; n < 7; ++n) { vi[n] += weighted_error * Ji[n]; } // g_i part
+        for (int n = 0; n < 7; ++n) { vj[n] += weighted_error * Jj[n]; } // g_j part
     }
 
-    // --- Process Rotation Residuals (k=0, 1, 2 for err[3], err[4], err[5]) ---
-    // Jacobians w.r.t. Right Perturbation are approx -I and +I (same as left approx)
-    for (int k = 0; k < 3; ++k) {
+    // --- Process Rotation Residuals (k=3, 4, 5 for err_r[x,y,z]) ---
+    // Using Right Perturbation Model Approximations: J_theta_i = -I, J_theta_j = I
+    for (int k = 0; k < 3; ++k) { // Loop over residual components err[3], err[4], err[5]
         for (int n = 0; n < 7; ++n) { Ji[n] = 0.0f; Jj[n] = 0.0f; } // Clear Jacobians
-        Ji[k + 3] = -1.0f; // ∂err_rot[k] / ∂delta_theta_i^R[k] ≈ -1
-        Jj[k + 3] = 1.0f;  // ∂err_rot[k] / ∂delta_theta_j^R[k] ≈ 1
+
+        // Jacobian Jj (w.r.t delta_x_j = [dt_j^b, dtheta_j^b, ds_j])
+        // ∂err_r[k] / ∂delta_theta_j^b[k] ≈ 1
+        Jj[k + 3] = 1.0f; // Jj[3], Jj[4], Jj[5]
+
+        // Jacobian Ji (w.r.t delta_x_i = [dt_i^b, dtheta_i^b, ds_i])
+        // ∂err_r[k] / ∂delta_theta_i^b[k] ≈ -1
+        Ji[k + 3] = -1.0f; // Ji[3], Ji[4], Ji[5]
 
         // Accumulate H/g
-        float weight = w[k + 3]; float error = err[k + 3]; int l = 0;
-        for (int n = 0; n < 14; ++n) { for (int m = 0; m <= n; ++m) { hij[l] += weight * Jx[n] * Jx[m]; l++; } }
-        for (int n = 0; n < 7; ++n) { vi[n] += weight * error * Ji[n]; vj[n] += weight * error * Jj[n]; }
+        int residual_idx = k + 3;
+        float weight = w[residual_idx]; float error = err[residual_idx]; int l = 0;
+        // H = J^T * W * J
+        for (int n = 0; n < 14; ++n) {
+            for (int m = 0; m <= n; ++m) {
+                hij[l] += weight * Jx[n] * Jx[m];
+                l++;
+            }
+        }
+        // g = J^T * W * err
+        float weighted_error = weight * error;
+        for (int n = 0; n < 7; ++n) { vi[n] += weighted_error * Ji[n]; }
+        for (int n = 0; n < 7; ++n) { vj[n] += weighted_error * Jj[n]; }
     }
 
-    // --- Process Scale Residual (using err[6], w[6]) ---
-    // Jacobians w.r.t. Right Perturbation are -1 and +1 (same as left)
-    for (int n = 0; n < 7; ++n) { Ji[n] = 0.0f; Jj[n] = 0.0f; } // Clear Jacobians
-    Ji[6] = -1.0f; // ∂err_s / ∂delta_s_i^R = -1
-    Jj[6] = 1.0f;  // ∂err_s / ∂delta_s_j^R = 1
-
-    // Accumulate H/g
-    float weight = w[6]; float error = err[6]; int l = 0;
-    for (int n = 0; n < 14; ++n) { for (int m = 0; m <= n; ++m) { hij[l] += weight * Jx[n] * Jx[m]; l++; } }
-    for (int n = 0; n < 7; ++n) { vi[n] += weight * error * Ji[n]; vj[n] += weight * error * Jj[n]; }
-
     // --- Write results directly to Global Memory ---
-    // Gradients g_i, g_j (J^T * W * err)
-    for (int n = 0; n < 7; ++n) { gs[0][idx][n] = vi[n]; gs[1][idx][n] = vj[n]; }
-    // Hessian blocks H_ii, H_ij, H_ji, H_jj (J^T * W * J)
-    l = 0;
-    for (int n = 0; n < 14; ++n) { for (int m = 0; m <= n; ++m) {
+    // Gradients g_i, g_j (Accumulated J^T * W * err)
+    for (int n = 0; n < 7; ++n) {
+         // Use atomicAdd if multiple edges might update the same pose block in parallel,
+         // otherwise direct write is fine if output buffers are per-edge.
+         // Assuming gs is pre-zeroed and output is per edge:
+         gs[0][idx][n] = vi[n]; // g_i
+         gs[1][idx][n] = vj[n]; // g_j
+    }
+
+    // Hessian blocks H_ii, H_ij, H_ji, H_jj (Accumulated J^T * W * J)
+    int l = 0; // Reset index for hij (upper triangle of 14x14 H)
+    for (int n = 0; n < 14; ++n) { // Row index of full H
+        for (int m = 0; m <= n; ++m) { // Col index of full H (upper triangle)
             float val = hij[l];
-            if (n < 7) { // Row i
-                if (m < 7) { // Col i -> H_ii
-                    Hs[0][idx][n][m] = val; if (n != m) Hs[0][idx][m][n] = val;
-                } else { // Col j -> H_ij / H_ji
-                    Hs[1][idx][n][m - 7] = val; Hs[2][idx][m - 7][n] = val;
+            // Deconstruct 14x14 H into 7x7 blocks H_ii, H_ij, H_ji, H_jj
+            if (n < 7) { // Row corresponds to pose i
+                if (m < 7) { // Column corresponds to pose i -> H_ii block
+                    // Use atomicAdd if needed, otherwise direct write:
+                    Hs[0][idx][n][m] = val; // H_ii[n, m]
+                    if (n != m) Hs[0][idx][m][n] = val; // H_ii[m, n] (symmetry)
+                } else { // Column corresponds to pose j -> H_ij block
+                    Hs[1][idx][n][m - 7] = val; // H_ij[n, m-7]
+                    Hs[2][idx][m - 7][n] = val; // H_ji[m-7, n] (H_ji = H_ij^T)
                 }
-            } else { // Row j
-                 if (m >= 7) { // Col j -> H_jj
-                    Hs[3][idx][n - 7][m - 7] = val; if (n != m) Hs[3][idx][m - 7][n - 7] = val;
-                }
-            } l++; } }
+            } else { // Row corresponds to pose j
+                 // Only need m >= 7 since we fill upper triangle (m <= n)
+                 if (m >= 7) { // Column corresponds to pose j -> H_jj block
+                    Hs[3][idx][n - 7][m - 7] = val; // H_jj[n-7, m-7]
+                    if (n != m) Hs[3][idx][m - 7][n - 7] = val; // H_jj[m-7, n-7] (symmetry)
+                 }
+            }
+            l++; // Move to next element in hij
+        }
+    }
+} // end of kernel
+
+
+// --- Function to Apply Scale Prior ---
+/**
+ * @brief Adds scale prior constraints to the Hessian and gradient vector.
+ *
+ * @param A The SparseBlock object holding the Hessian (A.A) and gradient (A.b). Modified in place.
+ * @param Twc_cpu CPU Tensor (double) containing current world poses [num_poses, 8].
+ * @param sbar_targets_cpu CPU Tensor (double) containing target scale for each pose [num_poses]. Invalid targets <= 0.
+ * @param num_fix Number of fixed poses at the beginning.
+ * @param sigma_scale_prior Standard deviation of the scale prior "measurement".
+ */
+void apply_scale_prior_cpu(
+    SparseBlock& A, // Pass by reference to modify
+    const torch::Tensor& Twc_cpu,
+    const torch::Tensor& sbar_targets_cpu,
+    int num_fix,
+    double sigma_scale_prior)
+{
+    if (sigma_scale_prior <= 1e-9) { // Prevent division by zero / huge info
+        std::cerr << "Warning: sigma_scale_prior is too small or zero. Skipping priors." << std::endl;
+        return;
+    }
+
+    const int num_poses = Twc_cpu.size(0);
+    const int pose_dim = A.M; // Should be 7 for Sim(3)
+    const int scale_dof_idx_in_block = pose_dim - 1; // Index 6 for scale DoF
+
+    auto Twc_acc = Twc_cpu.accessor<double, 2>();
+    auto sbar_acc = sbar_targets_cpu.accessor<double, 1>();
+
+    const double info_scale_prior = 1.0 / (sigma_scale_prior * sigma_scale_prior);
+    const double jacobian_s = 1.0; // Jacobian dr/d(delta_s) for r = log(si/sbar)
+
+    int scale_priors_added = 0;
+    double g_scale_prior_norm_sq = 0;
+    double h_scale_prior_sum = 0;
+
+    for (int i = num_fix; i < num_poses; ++i) {
+        // Direct mapping from global pose index to optimization index
+        int i_opt = i - num_fix;
+
+        // Ensure i_opt is within the bounds of the optimization problem size
+        if (i_opt < 0 || i_opt >= A.N) {
+             // This shouldn't happen with the direct mapping, but good sanity check
+             std::cerr << "Warning: Optimization index i_opt=" << i_opt << " out of bounds for global pose " << i << ". Skipping prior." << std::endl;
+             continue;
+        }
+
+        double sbar_i = sbar_acc[i];
+
+        // Check if sbar is valid
+        if (sbar_i <= 1e-6) { // Use small positive threshold
+            continue; // Skip this pose if target scale is invalid
+        }
+
+        double si = Twc_acc[i][scale_dof_idx_in_block]; // Get current scale si
+
+        if (si <= 1e-6) { // Avoid log(0) or issues with current scale being zero
+             // std::cerr << "Warning: Current scale si for pose " << i << " is near zero (" << si << "). Skipping prior." << std::endl;
+             continue;
+        }
+
+        // Residual: r_s = log(si / sbar_i)
+        double residual_s = log(si / sbar_i);
+
+        // --- Add contribution to A.A and A.b ---
+        long system_dof_index = (long)i_opt * pose_dim + scale_dof_idx_in_block;
+
+        // H_ii(scale,scale) += J^T * w * J = 1.0 * info_scale_prior * 1.0
+        double h_contrib = info_scale_prior * jacobian_s * jacobian_s; // = info_scale_prior
+        A.A.coeffRef(system_dof_index, system_dof_index) += h_contrib;
+        h_scale_prior_sum += h_contrib; // For debug
+
+        // g_i(scale) += J^T * w * r = 1.0 * info_scale_prior * residual_s
+        double g_contrib = info_scale_prior * jacobian_s * residual_s;
+        A.b(system_dof_index) += g_contrib;
+        g_scale_prior_norm_sq += g_contrib * g_contrib; // For debug
+
+        scale_priors_added++;
+    }
+
+    // Optional: Print debug info once per function call (outside the loop)
+    std::cout << "Applied " << scale_priors_added << " scale priors." << std::endl;
+    std::cout << "  ‖g_scale_prior_contrib‖ = " << std::sqrt(g_scale_prior_norm_sq) << std::endl;
+    std::cout << "  Sum(H_scale_prior_diag_contrib) = " << h_scale_prior_sum << std::endl;
 }
 
 std::vector<torch::Tensor> gauss_newton_rays_odom_cuda(
@@ -1120,9 +1796,11 @@ std::vector<torch::Tensor> gauss_newton_rays_odom_cuda(
   torch::Tensor Q,
   torch::Tensor odom_ii, torch::Tensor odom_jj, // odom edges, from i to j
   torch::Tensor Tij, // Tj in Ti, or delta T between i and j
-  const float sigma_odom,
+  torch::Tensor s_bar,
+  const float sigma_odom_t, const float sigma_odom_r,
   const float sigma_ray,
   const float sigma_dist,
+  const float sigma_scale_prior,
   const float C_thresh,
   const float Q_thresh,
   const int num_fix,
@@ -1136,6 +1814,7 @@ std::vector<torch::Tensor> gauss_newton_rays_odom_cuda(
   const int n = Xs.size(1);
 
   // Setup indexing
+  // TODO: it should make sure the unique kf idx is from both the visual and odometry edges
   torch::Tensor unique_kf_idx = get_unique_kf_idx(ii, jj);
   // For edge construction
   std::vector<torch::Tensor> inds = create_inds(unique_kf_idx, 0, ii, jj);
@@ -1161,9 +1840,11 @@ std::vector<torch::Tensor> gauss_newton_rays_odom_cuda(
   torch::Tensor Hs_odom = torch::zeros({4, num_odom_edges, pose_dim, pose_dim}, opts);
   torch::Tensor gs_odom = torch::zeros({2, num_odom_edges, pose_dim}, opts);
 
+  // Ensure sbar_targets is on CPU and double
+  auto sbar_targets_cpu = s_bar.to(torch::kCPU).to(torch::kFloat64);
+
   // For debugging outputs
   torch::Tensor dx;
-
   torch::Tensor delta_norm;
 
   for (int itr=0; itr<max_iter; itr++) {
@@ -1184,12 +1865,12 @@ std::vector<torch::Tensor> gauss_newton_rays_odom_cuda(
 
     // Odometry constraints
     if (num_odom_edges > 0) {
-      odom_constraint_kernel<<<num_odom_edges, THREADS>>>(
+      odom_constraint_kernel_left_perturb_log<<<num_odom_edges, THREADS>>>(
         Twc.packed_accessor32<float,2,torch::RestrictPtrTraits>(),
         Tij.packed_accessor32<float,2,torch::RestrictPtrTraits>(),
         odom_ii.packed_accessor32<long,1,torch::RestrictPtrTraits>(),
         odom_jj.packed_accessor32<long,1,torch::RestrictPtrTraits>(),
-        sigma_odom,
+        sigma_odom_t, sigma_odom_r,
         Hs_odom.packed_accessor32<float,4,torch::RestrictPtrTraits>(),
         gs_odom.packed_accessor32<float,3,torch::RestrictPtrTraits>()
       );
@@ -1208,6 +1889,17 @@ std::vector<torch::Tensor> gauss_newton_rays_odom_cuda(
     
     // Add odometry constraints if available
     if (num_odom_edges > 0) {
+      // print the Hs_odom and gs_odom for debugging TODO: remove this
+      auto g_vis  = gs     .reshape({-1,7}).cpu();
+      auto g_odom = gs_odom.reshape({-1,7}).cpu();
+      std::cout << "‖g_vis‖  = " << g_vis.norm().item<float>()  << std::endl;
+      std::cout << "‖g_odom‖ = " << g_odom.norm().item<float>() << std::endl;
+
+      auto H = Hs_odom.reshape({-1,7,7}).cpu();
+      std::cout << "Column‑6 infinity norm = "
+                << H.index({torch::indexing::Slice(), torch::indexing::Slice(), 6})
+                  .abs().sum().item<float>() << std::endl;
+
       A.update_lhs(Hs_odom.reshape({-1, pose_dim, pose_dim}), 
           torch::cat({odom_ii_opt, odom_ii_opt, odom_jj_opt, odom_jj_opt}), 
           torch::cat({odom_ii_opt, odom_jj_opt, odom_ii_opt, odom_jj_opt}));
@@ -1216,10 +1908,15 @@ std::vector<torch::Tensor> gauss_newton_rays_odom_cuda(
           torch::cat({odom_ii_opt, odom_jj_opt}));
     }
 
+    // --- Add the Scale Prior ---
+    // Get current poses on CPU for prior calculation
+    auto Twc_cpu = Twc.to(torch::kCPU).to(torch::kFloat64);
+    apply_scale_prior_cpu(A, Twc_cpu, sbar_targets_cpu, num_fix, sigma_scale_prior);
+    // --- End of Scale Prior Addition ---
+
     // NOTE: Accounting for negative here!
     dx = -A.solve();
 
-    //
     pose_retr_kernel<<<1, THREADS>>>(
       Twc.packed_accessor32<float,2,torch::RestrictPtrTraits>(),
       dx.packed_accessor32<float,2,torch::RestrictPtrTraits>(),

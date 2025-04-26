@@ -1,3 +1,4 @@
+import time
 import lietorch
 import torch
 # from mast3r_slam.config import config
@@ -7,6 +8,7 @@ from mast3r_slam.geometry import (
 )
 from mast3r_slam.mast3r_utils import mast3r_match_symmetric
 import mast3r_slam_backends
+from mast3r_slam.height_prior import RectanglePlaneEstimator
 
 
 class FactorGraph:
@@ -152,7 +154,23 @@ class FactorGraph:
 
         Cs = torch.stack([kf.get_average_conf() for kf in kfs])
 
-        return Xs, T_WCs, Cs
+        # compute h bar
+        start = time.time()
+        pe = RectanglePlaneEstimator()
+        # camera_height = 0.148 # for mini, in meters
+        camera_height = 0.561 # for mini, in meters
+        s_residuals = []
+        h, w = self.frames[0].img.shape[-2:]
+        for X in Xs:
+            h_bar = pe.run(X.cpu().numpy(),image_size=(h,w))
+            if h_bar is not None:
+                s_residuals.append(camera_height / h_bar)
+            else:
+                s_residuals.append(-1)
+        end = time.time()
+        print(f"Time taken: {end - start} seconds")
+
+        return Xs, T_WCs, Cs, s_residuals
 
     # def solve_GN_rays(self):
     #     pin = self.cfg["pin"]
@@ -173,7 +191,7 @@ class FactorGraph:
     #     delta_thresh = self.cfg["delta_norm"]
 
     #     pose_data = T_WCs.data[:, 0, :]
-    #     mast3r_slam_backends.gauss_newton_rays(
+    #     dx = mast3r_slam_backends.gauss_newton_rays(
     #         pose_data,
     #         Xs,
     #         Cs,
@@ -190,6 +208,7 @@ class FactorGraph:
     #         max_iter,
     #         delta_thresh,
     #     )
+    #     print(f"dx: {dx}")
 
     #     # Update the keyframe T_WC
     #     # TODO how to update the updated poses?
@@ -202,7 +221,7 @@ class FactorGraph:
         if n_unique_kf <= pin:
             return
 
-        Xs, T_WCs, Cs = self.get_poses_points(unique_kf_idx)
+        Xs, T_WCs, Cs, s_bar = self.get_poses_points(unique_kf_idx)
 
         ii, jj, idx_ii2jj, valid_match, Q_ii2jj = self.prep_two_way_edges()
 
@@ -219,10 +238,15 @@ class FactorGraph:
         odom_ii = self.odometry_ii
         odom_jj = self.odometry_jj
         odom_delta_T = self.odometry_delta_T[:,0,:]
-        sigma_odom = 0.1
+        sigma_odom_t = 0.001
+        sigma_odom_r = 0.005
+        sigma_ray = 1
+        sigma_scale_prior = 1
+        s_bar = torch.tensor(s_bar)
+        # print(f"s_bar: {s_bar}")
 
 
-        mast3r_slam_backends.gauss_newton_rays_odom(
+        dx = mast3r_slam_backends.gauss_newton_rays_odom(
             pose_data,
             Xs,
             Cs,
@@ -234,15 +258,19 @@ class FactorGraph:
             odom_ii, # odom edges, from i to j
             odom_jj,
             odom_delta_T, # Tj in Ti, or delta T between i and j
-            sigma_odom,
+            s_bar,
+            sigma_odom_t,
+            sigma_odom_r,
             sigma_ray,
             sigma_dist,
+            sigma_scale_prior,
             C_thresh,
             Q_thresh,
             pin,
             max_iter,
             delta_thresh,
         )
+        # print(f"dx: {dx}")
 
         # Update the keyframe T_WC
         # TODO how to update the updated poses?

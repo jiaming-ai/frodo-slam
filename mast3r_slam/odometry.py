@@ -102,8 +102,16 @@ def pos_yaw_to_se3(pos, yaw):
 # --------------  main odometry class ----------------------------------------
 class StraightOrSpinOdometry:
     # --- geometry -----------------------------------------------------------
+    # mini
     _WHEEL_DIAM_M = 0.095
     _TRACK_M = 0.160
+    _CAMERA_OFFSET_M = 0.075
+
+    # zero
+    # _WHEEL_DIAM_M = 0.13
+    # _TRACK_M = 0.2
+    # _CAMERA_OFFSET_M = 0.06
+
     _CIRC_M = math.pi * _WHEEL_DIAM_M
     _RPM_EQ_EPS = 5
     # --- feature / ray params ----------------------------------------------
@@ -182,6 +190,7 @@ class StraightOrSpinOdometry:
             new_h, new_w = int(h * scale), int(w * scale)
             frame = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
+        frame = frame[:,:,::-1]
         timestamp = time.time()
         return timestamp, frame / 255.0, pose
     # --------------  low‑level utils  --------------------------------------
@@ -280,12 +289,25 @@ class StraightOrSpinOdometry:
                 except Exception as e:
                     logger.error(f"Error computing yaw from frames: {e}")
                     dth = 0
+
                 if dth is not None:
+                    # with self._lock:
+                    #     self._th = self._wrap(self._th + dth)
+                    #     self._path.append((self._x, self._y))
+
                     with self._lock:
-                        self._th = self._wrap(self._th + dth)
+                        old_th = self._th
+                        new_th = self._wrap(old_th + dth)
+
+                        # account for the camera’s forward offset:
+                        r = self._CAMERA_OFFSET_M
+                        dy = r * (math.sin(new_th) - math.sin(old_th))
+                        dx = r * (math.cos(new_th) - math.cos(old_th))
+
+                        self._x += dx
+                        self._y += dy
+                        self._th = new_th
                         self._path.append((self._x, self._y))
-
-
 
             # integrate each RPM sample -------------------------------
             straight = False
@@ -583,7 +605,8 @@ class OdometryData(torch.utils.data.Dataset):
                 return None, None, None
             item = self.data[self.idx]
             self.idx += 1
-            frame = item['frame'][:,:,::-1]
+            # frame = item['frame'][:,:,::-1]
+            frame = item['frame']
             if self.use_odometry:
                 return item['timestamp'], frame, item['pose']
             else:
@@ -618,7 +641,8 @@ class OdometryData(torch.utils.data.Dataset):
         
         # Return the current frame and pose
         item = self.data[self.current_idx]
-        frame = item['frame'][:,:,::-1]
+        # frame = item['frame'][:,:,::-1]
+        frame = item['frame']
         if self.use_odometry:
             return item['timestamp'], frame, item['pose']
         else:
@@ -635,6 +659,6 @@ if __name__ == "__main__":
     # finally:
     #     odo.stop()
 
-    record_odometry("datasets/recorded/easy.pkl", duration_s=30.0, poll_s=0.1)
+    record_odometry("datasets/recorded/outdoor.pkl", duration_s=300.0, poll_s=0.1)
     # data = replay_odometry("odometry.pkl")
     # print(data)

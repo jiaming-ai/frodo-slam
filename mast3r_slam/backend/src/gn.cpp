@@ -33,9 +33,11 @@ std::vector<torch::Tensor> gauss_newton_rays_odom(
   torch::Tensor Q,
   torch::Tensor odom_ii, torch::Tensor odom_jj, // odom edges, from i to j
   torch::Tensor Tij, // Tj in Ti, or delta T between i and j
-  const float sigma_odom,
+  torch::Tensor s_residuals,
+  const float sigma_odom_t, const float sigma_odom_r,
   const float sigma_ray,
   const float sigma_dist,
+  const float sigma_scale_prior,
   const float C_thresh,
   const float Q_thresh,
   const int num_fix,
@@ -52,8 +54,11 @@ std::vector<torch::Tensor> gauss_newton_rays_odom(
   CHECK_CONTIGUOUS(Tij);
 
   // const at::cuda::OptionalCUDAGuard device_guard(device_of(x1));
-  return gauss_newton_rays_odom_cuda(Twc, Xs, Cs, ii, jj, idx_ii2jj, valid_match, Q,
-      odom_ii, odom_jj, Tij, sigma_odom, sigma_ray, sigma_dist, C_thresh, Q_thresh, num_fix, max_iter, delta_thresh);
+  return gauss_newton_rays_odom_cuda(
+    Twc, Xs, Cs, ii, jj, idx_ii2jj, valid_match, Q,
+    odom_ii, odom_jj, Tij, s_residuals, 
+    sigma_odom_t, sigma_odom_r, sigma_ray, sigma_dist, sigma_scale_prior, 
+    C_thresh, Q_thresh, num_fix, max_iter, delta_thresh);
 }
 std::vector<torch::Tensor> gauss_newton_rays(
   torch::Tensor Twc, torch::Tensor Xs, torch::Tensor Cs,

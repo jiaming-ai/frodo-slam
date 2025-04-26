@@ -23,7 +23,6 @@ from mast3r_slam.map_visualization import MapVisualizer
 venv_bin = os.path.join(sys.prefix, 'bin')
 os.environ['PATH'] = venv_bin + os.pathsep + os.environ['PATH']
 
-
         
 
 def get_frame(resize=512):
@@ -74,19 +73,24 @@ def run_robot(args):
     # )
     # odometry.start()
     odometry = OdometryData(
-        data_path="datasets/recorded/straight.pkl",
+        data_path="datasets/recorded/outdoor.pkl",
         wall_clock=False,
         use_odometry=True
     )
     
     # # Get first frame to determine image size
     # frame = get_frame(args.resize)
-    timestamp, frame, odom_pose = odometry.get_frame_and_pose()
 
-    if frame is None:
-        print("Failed to get initial frame from robot camera")
-        return
-    
+    get_initial = False
+    while not get_initial:
+        timestamp, frame, odom_pose = odometry.get_frame_and_pose()
+        
+        if frame is not None:
+            get_initial = True
+        
+        print("Waiting for initial frame...")
+        time.sleep(0.1)
+
     h, w = frame.shape[:2]
     # Load calibration if provided
     K = None
@@ -118,12 +122,10 @@ def run_robot(args):
     
     # Process frames continuously
     frame_count = 0
-    last_processed_time = 0
-    min_frame_interval = 0.03  # Minimum 30ms between frames (~33 FPS max)
     start_time = time.time()
 
-    map_visualizer = MapVisualizer(visualization_enabled=False)
-    map_visualizer.visualize()
+    # map_visualizer = MapVisualizer(visualization_enabled=True)
+    # map_visualizer.visualize()
     try:
         while True:
             # Get the most recent frame
@@ -148,9 +150,9 @@ def run_robot(args):
                 fps = frame_count / elapsed if elapsed > 0 else 0
                 print(f"Processed {frame_count} frames at {fps:.2f} FPS")
             
-            if new_kf and map_visualizer.visualization_enabled:
-                map_visualizer.add_pose_vio(pose)
-                map_visualizer.add_pose_odometry(odom_pose)
+            # if new_kf and map_visualizer.visualization_enabled:
+            #     map_visualizer.add_pose_vio(pose)
+            #     map_visualizer.add_pose_odometry(odom_pose)
             
     except KeyboardInterrupt:
         print(f"Interrupted after processing {frame_count} frames")
@@ -159,7 +161,7 @@ def run_robot(args):
         stop_event.set()
         # odometry.stop()
         vio.terminate()
-        map_visualizer.terminate()
+        # map_visualizer.terminate()
         print(f"Processed {frame_count} frames in {time.time() - start_time:.2f} seconds")
 
 def run_dataset(args):

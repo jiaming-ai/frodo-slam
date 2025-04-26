@@ -61,8 +61,17 @@ class MapVisualizer:
                 self.running = False
                 return
             
-            # Add coordinate frame at origin
+            # Add coordinate frame at origin - aligned with x left, y down, z forward
             origin = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.5)
+            # Rotate to match the desired coordinate system
+            R = np.array([
+                [0, 0, 1],  # x = forward → left
+                [1, 0, 0],  # y = right → down
+                [0, 1, 0]   # z = down → forward
+            ])
+            transform = np.eye(4)
+            transform[:3, :3] = R
+            origin.transform(transform)
             self.vis.add_geometry(origin)
             
             # Add initial empty trajectories
@@ -109,6 +118,28 @@ class MapVisualizer:
             return None
             
         frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=size)
+        
+        # Set different colors for VIO and odometry frames
+        if not is_vio:  # For odometry frames
+            # Modify the colors of the coordinate axes for odometry
+            # Get the triangles and vertex colors
+            vertices = np.asarray(frame.vertices)
+            triangles = np.asarray(frame.triangles)
+            colors = np.asarray(frame.vertex_colors)
+            
+            # Change colors: lighter blue for x, cyan for y, light blue for z
+            # Identify vertices for each axis (this depends on how Open3D creates the frame)
+            # We'll use a simple approach based on the default coloring
+            red_mask = colors[:, 0] > 0.5  # x-axis vertices (originally red)
+            green_mask = colors[:, 1] > 0.5  # y-axis vertices (originally green)
+            blue_mask = colors[:, 2] > 0.5  # z-axis vertices (originally blue)
+            
+            # Change colors
+            colors[red_mask] = [0.3, 0.3, 1.0]  # Light blue for x-axis
+            colors[green_mask] = [0.0, 0.8, 0.8]  # Cyan for y-axis
+            colors[blue_mask] = [0.5, 0.5, 1.0]  # Lighter blue for z-axis
+            
+            frame.vertex_colors = o3d.utility.Vector3dVector(colors)
         
         # Extract translation and rotation from pose
         if is_vio:  # VIO pose (Sim3)
@@ -172,6 +203,8 @@ class MapVisualizer:
             if not self.origin_set:
                 self.origin_vio = copy.deepcopy(pose)
                 self.origin_set = True
+                # Also set the odometry origin to be the same
+                self.origin_odom = self.origin_vio
             
             # Store the pose
             self.vio_poses.append(copy.deepcopy(pose))

@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 from mast3r_slam.frame import Frame
 from mast3r_slam.geometry import (
@@ -22,6 +23,7 @@ from mast3r_slam.matching import pixel_to_lin, lin_to_pixel
 from mast3r_slam.frame import Mode, KeyframesCuda
 from mast3r_slam.pgo import PoseGraph
 from loguru import logger
+from mast3r_slam.height_prior import RectanglePlaneEstimator
 class LocalMapOptimizer:
     def __init__(self, 
                  model,
@@ -172,6 +174,12 @@ class FrameTracker:
             self.model, frame, self.last_kf, idx_i2j_init=self.idx_f2k
         )
         frame.update_pointmap(Xff, Cff)
+
+        # # compute h bar
+        # h_bar = RectanglePlaneEstimator().run((
+        #     frame.img.cpu()[0].permute(1,2,0).numpy())[:,:,::-1], 
+        #     Xff.cpu().numpy())
+
 
         # Save idx for next
         self.idx_f2k = idx_f2k.clone()

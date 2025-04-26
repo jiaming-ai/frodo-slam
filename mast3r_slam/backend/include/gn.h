@@ -37,9 +37,11 @@ std::vector<torch::Tensor> gauss_newton_rays_odom(
   torch::Tensor Q,
   torch::Tensor odom_ii, torch::Tensor odom_jj, // odom edges, from i to j
   torch::Tensor Tij, // Tj in Ti, or delta T between i and j
-  const float sigma_odom,
+  torch::Tensor s_bar,
+  const float sigma_odom_t, const float sigma_odom_r,
   const float sigma_ray,
   const float sigma_dist,
+  const float sigma_scale_prior,
   const float C_thresh,
   const float Q_thresh,
   const int num_fix,
@@ -53,9 +55,11 @@ std::vector<torch::Tensor> gauss_newton_rays_odom_cuda(
   torch::Tensor Q,
   torch::Tensor odom_ii, torch::Tensor odom_jj, // odom edges, from i to j
   torch::Tensor Tij, // Tj in Ti, or delta T between i and j
-  const float sigma_odom,
+  torch::Tensor s_bar,
+  const float sigma_odom_t, const float sigma_odom_r,
   const float sigma_ray,
   const float sigma_dist,
+  const float sigma_scale_prior,
   const float C_thresh,
   const float Q_thresh,
   const int num_fix,
