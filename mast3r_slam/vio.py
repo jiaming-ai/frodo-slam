@@ -72,12 +72,13 @@ def relocalization(frame, keyframes, factor_graph, retrieval_database, config):
         return successful_loop_closure
 
 
-def run_backend(config, model, states, keyframes, main2backend, backend2main, K=None):
+def run_backend(config, device, states, keyframes, main2backend, backend2main, K=None):
     set_global_config(config)
 
-    device = keyframes.device
+    model = load_mast3r(device=device)
     factor_graph = FactorGraph(model, keyframes, config,K, device)
     retrieval_database = load_retriever(model)
+    # model._decoder = torch.compile(model._decoder)
 
     mode = states.get_mode()
     while mode is not Mode.TERMINATED:
@@ -88,13 +89,6 @@ def run_backend(config, model, states, keyframes, main2backend, backend2main, K=
                     logger.info("Resetting backend")
                     factor_graph.reset()
                     retrieval_database.reset()
-                # if "odometry_factor" in msg:
-                #     odometry = msg["odometry_factor"]
-                #     factor_graph.add_odometry_factors(
-                #         odometry["ii"], 
-                #         odometry["jj"], 
-                #         odometry["delta_T"]
-                #         )
 
         except Exception as e:
             pass  # No message available
@@ -191,7 +185,7 @@ class VIO:
         # self.altas = [self.keyframes]
         # Load model
         self.model = load_mast3r(device=self.device)
-        
+
         if self.multi_process:
             manager = mp.Manager()
             self.keyframes = SharedKeyframes(manager, self.h, self.w, device=self.device)
@@ -215,7 +209,7 @@ class VIO:
         if use_backend:
             self.main2backend = new_queue(manager, not visualize)
             self.backend2main = new_queue(manager, not visualize)
-            self.backend = mp.Process(target=run_backend, args=(config, self.model, self.states, self.keyframes, self.main2backend, self.backend2main))
+            self.backend = mp.Process(target=run_backend, args=(config, device, self.states, self.keyframes, self.main2backend, self.backend2main))
             self.backend.start()
 
         

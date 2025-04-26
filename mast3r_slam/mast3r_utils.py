@@ -11,13 +11,34 @@ from mast3r_slam.config import config
 import mast3r_slam.matching as matching
 
 
-def load_mast3r(path=None, device="cuda"):
+def load_mast3r(path=None, device="cuda", compile=True):
     weights_path = (
         "checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth"
         if path is None
         else path
     )
-    model = AsymmetricMASt3R.from_pretrained(weights_path).to(device)
+    model = AsymmetricMASt3R.from_pretrained(weights_path).to(device).eval()
+    
+    if compile:
+        print("Compiling model")
+        # class _EncodeImageWrapper(torch.nn.Module):
+        #     def __init__(self, outer):
+        #         super().__init__()
+        #         self.outer = outer
+        #     def forward(self, image, true_shape):
+        #         x, pos = self.outer.patch_embed(image, true_shape=true_shape)
+        #         assert self.outer.enc_pos_embed is None
+        #         for blk in self.outer.enc_blocks:
+        #             x = blk(x, pos)
+        #         x = self.outer.enc_norm(x)
+        #         return x, pos, None
+
+        # attach the compiled wrapper to the same name
+        # model._encode_image = torch.compile(_EncodeImageWrapper(model))
+        # model._encode_image = torch.compile(model._encode_image)
+        # model._decoder = torch.compile(model._decoder, mode="max-autotune-no-cudagraphs")
+        # model._downstream_head = torch.compile(model._downstream_head, mode="max-autotune-no-cudagraphs")
+        print("Done compiling model")
     return model
 
 

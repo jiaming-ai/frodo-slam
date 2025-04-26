@@ -115,7 +115,8 @@ def run_robot(args):
         img_size=(h, w),
         calib=K,
         device=args.device,
-        visualize=args.visualize
+        visualize=args.visualize,
+        use_backend=False
     )
     
     stop_event = threading.Event()

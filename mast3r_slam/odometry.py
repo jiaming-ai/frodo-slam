@@ -60,7 +60,7 @@ def angle_between(vec1: np.ndarray, vec2: np.ndarray) -> float:
 
 
 def ransac_mode(
-    angles: List[float], iters: int = 100, thresh_deg: float = 1.0
+    angles: List[float], iters: int = 100, thresh_rad: float = 0.1
 ) -> float | None:
     """
     Robustly pick the dominant angle with 1‑D RANSAC.
@@ -71,7 +71,7 @@ def ransac_mode(
     best_med, best_inliers = None, 0
     for _ in range(iters):
         a0 = random.choice(angles)
-        inliers = [a for a in angles if abs(a - a0) <= thresh_deg]
+        inliers = [a for a in angles if abs(a - a0) <= thresh_rad]
         if len(inliers) > best_inliers:
             best_inliers = len(inliers)
             best_med = statistics.median(inliers)
@@ -99,37 +99,57 @@ def pos_yaw_to_se3(pos, yaw):
     t = torch.tensor([-pos[1], 0.0, pos[0]], dtype=torch.float32)
     return lietorch.SE3(torch.cat([t, q]).unsqueeze(0))
 
+
+def set_default_params(robot_type: str = "mini"):
+    if robot_type == "mini":
+        StraightOrSpinOdometry._WHEEL_DIAM_M = 0.095
+        StraightOrSpinOdometry._TRACK_M = 0.160
+        StraightOrSpinOdometry._CAMERA_OFFSET_M = 0.075
+        StraightOrSpinOdometry._CAMERA_HEIGHT = 0.148
+        StraightOrSpinOdometry._CIRC_M = math.pi * StraightOrSpinOdometry._WHEEL_DIAM_M
+    elif robot_type == "zero":
+        StraightOrSpinOdometry._WHEEL_DIAM_M = 0.13
+        StraightOrSpinOdometry._TRACK_M = 0.2
+        StraightOrSpinOdometry._CAMERA_OFFSET_M = 0.06
+        StraightOrSpinOdometry._CAMERA_HEIGHT = 0.561
+        StraightOrSpinOdometry._CIRC_M = math.pi * StraightOrSpinOdometry._WHEEL_DIAM_M
+
 # --------------  main odometry class ----------------------------------------
 class StraightOrSpinOdometry:
     # --- geometry -----------------------------------------------------------
-    # mini
-    _WHEEL_DIAM_M = 0.095
-    _TRACK_M = 0.160
-    _CAMERA_OFFSET_M = 0.075
+    # # mini
+    # _WHEEL_DIAM_M = 0.095
+    # _TRACK_M = 0.160
+    # _CAMERA_OFFSET_M = 0.075
 
     # zero
-    # _WHEEL_DIAM_M = 0.13
-    # _TRACK_M = 0.2
-    # _CAMERA_OFFSET_M = 0.06
+    _WHEEL_DIAM_M = 0.13
+    _TRACK_M = 0.2
+    _CAMERA_OFFSET_M = 0.06
 
     _CIRC_M = math.pi * _WHEEL_DIAM_M
     _RPM_EQ_EPS = 5
     # --- feature / ray params ----------------------------------------------
     _FEATURES_MAX = 2000
     _MIN_MATCH_ANGLES = 15          # require this many usable ray pairs
-    _RANSAC_THRESH_DEG = 1.0
+    _RANSAC_THRESH_RAD = 0.05 # 3 degrees
     _RANSAC_ITERS = 150
     _ORB_BRUTEFORCE_LEVELS = [200, 1000, 2000, 5000]
 
     def __init__(
         self,
-        *,
-        directions_json: str = "pixel_direction_dict_s.json",
+        robot_type: str = "mini", # "zero" | "mini"
         rpm_api: str = "http://localhost:8000/data",
         cam_api: str = "http://localhost:8000/v2/front",
         poll_s: float = 0.1,
         timeout_s: float = 2.0,
     ):
+        set_default_params(robot_type)
+        if robot_type == "mini":
+            self._dirs = load_directions_dict("pixel_direction_dict_s.json")
+        elif robot_type == "zero":
+            self._dirs = load_directions_dict("pixel_direction_dict.json")
+
         # REST end‑points
         self._rpm_api, self._cam_api = rpm_api, cam_api
         self._poll_s, self._timeout = poll_s, timeout_s
@@ -142,9 +162,6 @@ class StraightOrSpinOdometry:
         # integration bookkeeping
         self._prev_frame: np.ndarray | None = None
         self._prev_ts: float | None = None
-
-        # ray directions
-        self._dirs = load_directions_dict(directions_json)
 
         # thread control
         self._running = False
@@ -252,7 +269,7 @@ class StraightOrSpinOdometry:
             best = ransac_mode(
                 angles,
                 iters=self._RANSAC_ITERS,
-                thresh_deg=self._RANSAC_THRESH_DEG,
+                thresh_rad=self._RANSAC_THRESH_RAD,
             )
             if best is None:
                 best = statistics.median(angles)
@@ -264,24 +281,34 @@ class StraightOrSpinOdometry:
     def _loop(self):
         while self._running:
             # wheel RPMs ------------------------------------------------
-            rpm_rows = (
-                requests.get(self._rpm_api, timeout=self._timeout)
-                .json()
-                .get("rpms", [])
-            )
+            try:
+                rpm_rows = (
+                    requests.get(self._rpm_api, timeout=self._timeout)
+                    .json()
+                    .get("rpms", [])
+                )
+            except Exception as e:
+                logger.error(f"Error getting RPMs: {e}")
+                continue
+
             rpm_rows.sort(key=lambda r: r[4])  # by timestamp
 
             # camera frame (Base‑64 JPEG) ------------------------------
-            b64_img = (
-                requests.get(self._cam_api, timeout=self._timeout)
-                .json()
-                .get("front_frame", "")
-            )
-            frame = (
-                cv2.imdecode(np.frombuffer(base64.b64decode(b64_img), np.uint8),
-                                cv2.IMREAD_COLOR)
-                if b64_img else None
-            )
+            try:
+                b64_img = (
+                    requests.get(self._cam_api, timeout=self._timeout)
+                    .json()
+                    .get("front_frame", "")
+                )
+                frame = (
+                    cv2.imdecode(np.frombuffer(base64.b64decode(b64_img), np.uint8),
+                                    cv2.IMREAD_COLOR)
+                    if b64_img else None
+                )
+            except Exception as e:
+                logger.error(f"Error getting camera frame: {e}")
+                continue
+
             # first compute yaw from frames
             if frame is not None and self._prev_frame is not None:
                 try:
@@ -497,7 +524,7 @@ class StraightOrSpinOdometry:
             print(f"Error sending robot command: {e}")
 
 
-def record_odometry(data_path: str, duration_s: float = 60.0, poll_s: float = 0.1):
+def record_odometry(data_path: str, duration_s: float = 60.0, poll_s: float = 0.1, robot_type: str = "mini"):
     """
     Record odometry data to a file for the specified duration while showing visualization.
     
@@ -507,8 +534,9 @@ def record_odometry(data_path: str, duration_s: float = 60.0, poll_s: float = 0.
         poll_s: Time between polls in seconds
     """
     
+    data_path = data_path + f"_{robot_type}.pkl"
     logger.info(f"Recording odometry data to {data_path} for {duration_s} seconds")
-    odo = StraightOrSpinOdometry(directions_json="config/pixel_direction_dict_s.json")
+    odo = StraightOrSpinOdometry(robot_type=robot_type)
     odo.start()
     
     # Start visualization in a separate thread
@@ -582,6 +610,8 @@ class OdometryData(torch.utils.data.Dataset):
         self.last_data_time = None
         self.current_idx = 0
         self.idx = 0
+        self.robot_type = data_path.split("_")[-1].split(".")[0]
+        set_default_params(self.robot_type)
 
     def __len__(self):
         return len(self.data)
@@ -659,6 +689,6 @@ if __name__ == "__main__":
     # finally:
     #     odo.stop()
 
-    record_odometry("datasets/recorded/outdoor.pkl", duration_s=300.0, poll_s=0.1)
+    record_odometry("datasets/recorded/outdoor.pkl", duration_s=300.0, poll_s=0.1, robot_type="mini")
     # data = replay_odometry("odometry.pkl")
     # print(data)

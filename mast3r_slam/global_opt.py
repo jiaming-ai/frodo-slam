@@ -7,6 +7,7 @@ from mast3r_slam.geometry import (
     constrain_points_to_ray,
 )
 from mast3r_slam.mast3r_utils import mast3r_match_symmetric
+from mast3r_slam.odometry import StraightOrSpinOdometry
 import mast3r_slam_backends
 from mast3r_slam.height_prior import RectanglePlaneEstimator
 
@@ -157,8 +158,7 @@ class FactorGraph:
         # compute h bar
         start = time.time()
         pe = RectanglePlaneEstimator()
-        # camera_height = 0.148 # for mini, in meters
-        camera_height = 0.561 # for mini, in meters
+        camera_height = StraightOrSpinOdometry._CAMERA_HEIGHT
         s_residuals = []
         h, w = self.frames[0].img.shape[-2:]
         for X in Xs:
@@ -239,8 +239,8 @@ class FactorGraph:
         odom_jj = self.odometry_jj
         odom_delta_T = self.odometry_delta_T[:,0,:]
         sigma_odom_t = 0.001
-        sigma_odom_r = 0.005
-        sigma_ray = 1
+        sigma_odom_r = 0.01
+        sigma_ray = 0.01
         sigma_scale_prior = 1
         s_bar = torch.tensor(s_bar)
         # print(f"s_bar: {s_bar}")
