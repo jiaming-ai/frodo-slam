@@ -11,7 +11,7 @@
             "program": "mast3r_slam/odometry.py",
             "console": "integratedTerminal",
             "cwd": "${workspaceFolder}",
-            "python": "/home/jiaming/Projects/frodobot/ms/.venv/bin/python",
+            "python": "/home/jiaming/Projects/frodobot/mslam2/.venv/bin/python",
             "justMyCode": false,
             "args": [
                 "--dataset",
@@ -31,7 +31,7 @@
             "program": "run_vio.py",
             "console": "integratedTerminal",
             "cwd": "${workspaceFolder}",
-            "python": "/home/jiaming/Projects/frodobot/ms/.venv/bin/python",
+            "python": "/home/jiaming/Projects/frodobot/mslam2/.venv/bin/python",
             "justMyCode": false,
             "args": [
                 "--dataset",

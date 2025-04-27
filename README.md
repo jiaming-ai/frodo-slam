@@ -52,8 +52,9 @@ pip install -e thirdparty/mast3r
 pip install -e thirdparty/in3d
 pip install --no-build-isolation -e .
  
-
+pip install open3d loguru pypose
 # install flash attention
+pip install flashattention --no-build-isolation
 
 # Optionally install torchcodec for faster mp4 loading
 pip install torchcodec==0.1

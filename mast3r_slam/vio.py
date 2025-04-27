@@ -74,10 +74,11 @@ def relocalization(frame, keyframes, factor_graph, retrieval_database, config):
 
 def run_backend(config, device, states, keyframes, main2backend, backend2main, K=None):
     set_global_config(config)
-
+    
+    torch.cuda.set_device(1)
     model = load_mast3r(device=device)
     factor_graph = FactorGraph(model, keyframes, config,K, device)
-    retrieval_database = load_retriever(model)
+    retrieval_database = load_retriever(model, device=device)
     # model._decoder = torch.compile(model._decoder)
 
     mode = states.get_mode()
@@ -207,9 +208,10 @@ class VIO:
             self.viz.start()
         
         if use_backend:
+            device_backend = torch.device("cuda:1")
             self.main2backend = new_queue(manager, not visualize)
             self.backend2main = new_queue(manager, not visualize)
-            self.backend = mp.Process(target=run_backend, args=(config, device, self.states, self.keyframes, self.main2backend, self.backend2main))
+            self.backend = mp.Process(target=run_backend, args=(config, device_backend, self.states, self.keyframes, self.main2backend, self.backend2main))
             self.backend.start()
 
         
