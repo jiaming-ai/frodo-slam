@@ -283,7 +283,7 @@ class FactorGraph:
         )
 
         # Update the keyframe T_WC
-        self.frames.update_T_WCs(T_WCs[pin:], unique_kf_idx[pin:])
+        self.frames.update_T_WCs(pose_data[pin:], unique_kf_idx[pin:])
 
     def solve_GN_calib(self):
         K = self.K

@@ -68,18 +68,17 @@ def run_robot(args):
     # Load config
     load_config(args.config)
 
-    odometry = StraightOrSpinOdometry(
-        robot_type="mini"
-    )
+    if args.robot_record_dataset:
+        odometry = OdometryData(
+            data_path=args.robot_record_dataset,
+            wall_clock=False,
+            use_odometry=True
+        )
+    else:
+        odometry = StraightOrSpinOdometry(
+            robot_type=args.robot_type
+        )
     odometry.start()
-    # odometry = OdometryData(
-    #     data_path="datasets/recorded/outdoor_zero.pkl",
-    #     wall_clock=False,
-    #     use_odometry=True
-    # )
-    
-    # # Get first frame to determine image size
-    # frame = get_frame(args.resize)
 
     get_initial = False
     while not get_initial:
@@ -245,6 +244,12 @@ def run_dataset(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run VIO on a dataset")
+    parser.add_argument("--robot", action="store_true",
+                        help="Run on robot")
+    parser.add_argument("--robot_record_dataset", default="",
+                        help="Path to robot record dataset")
+    parser.add_argument("--robot_type", default="mini",
+                        help="Type of robot")
     parser.add_argument("--dataset", default="datasets/tum/rgbd_dataset_freiburg1_360",
                         help="Path to dataset")
     parser.add_argument("--config", default="config/base_no_fnn.yaml", 
@@ -264,7 +269,9 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    # logger.add(sys.stdout, level="DEBUG" if args.debug else "INFO")
+    logger.add("logs/vio.log", level="DEBUG" if args.debug else "INFO")
     
-    # run_dataset(args)
-    run_robot(args)
+    if args.robot:
+        run_robot(args)
+    else:
+        run_dataset(args)
