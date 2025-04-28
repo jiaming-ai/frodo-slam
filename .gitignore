@@ -139,4 +139,5 @@ screen.yaml
 *.ini
 notebooks/*
 
+.vscode/
 data

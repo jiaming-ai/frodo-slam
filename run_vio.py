@@ -110,16 +110,16 @@ def run_robot(args):
     
 
     if args.use_multiple_gpu and torch.cuda.device_count() > 1:
-        backend_device = 1
+        backend_device = "cuda:1"
     else:
-        backend_device = 0
+        backend_device = "cuda:0"
 
     # Initialize VIO
     vio = VIO(
         config=config,
         img_size=(h, w),
         calib=K,
-        tracking_device_id=args.device,
+        tracking_device=args.device,
         visualize=args.visualize,
         backend_device=backend_device
     )
