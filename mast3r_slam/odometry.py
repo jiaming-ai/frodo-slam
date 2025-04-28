@@ -147,9 +147,9 @@ class StraightOrSpinOdometry:
     ):
         set_default_params(robot_type)
         if robot_type == "mini":
-            self._dirs = load_directions_dict("pixel_direction_dict_s.json")
+            self._dirs = load_directions_dict("config/pixel_direction_dict_s.json")
         elif robot_type == "zero":
-            self._dirs = load_directions_dict("pixel_direction_dict.json")
+            self._dirs = load_directions_dict("config/pixel_direction_dict.json")
 
         # REST end‑points
         self._rpm_api, self._cam_api = rpm_api, cam_api

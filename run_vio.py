@@ -68,15 +68,15 @@ def run_robot(args):
     # Load config
     load_config(args.config)
 
-    # odometry = StraightOrSpinOdometry(
-    #     directions_json="config/pixel_direction_dict_s.json"
-    # )
-    # odometry.start()
-    odometry = OdometryData(
-        data_path="datasets/recorded/outdoor_zero.pkl",
-        wall_clock=False,
-        use_odometry=True
+    odometry = StraightOrSpinOdometry(
+        robot_type="mini"
     )
+    odometry.start()
+    # odometry = OdometryData(
+    #     data_path="datasets/recorded/outdoor_zero.pkl",
+    #     wall_clock=False,
+    #     use_odometry=True
+    # )
     
     # # Get first frame to determine image size
     # frame = get_frame(args.resize)
