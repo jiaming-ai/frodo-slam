@@ -74,7 +74,7 @@ def relocalization(frame, keyframes, factor_graph, retrieval_database, config):
 
 def run_backend(config, device, states, keyframes, main2backend, backend2main, K=None):
     set_global_config(config)
-    
+
     torch.cuda.set_device(1)
     model = load_mast3r(device=device)
     factor_graph = FactorGraph(model, keyframes, config,K, device)
@@ -82,6 +82,7 @@ def run_backend(config, device, states, keyframes, main2backend, backend2main, K
     # model._decoder = torch.compile(model._decoder)
 
     mode = states.get_mode()
+    backend2main.put({"Init": True})
     while mode is not Mode.TERMINATED:
         try:
             msg = main2backend.get_nowait()
@@ -232,6 +233,18 @@ class VIO:
 
         self.last_odom_pose = lietorch.Sim3.Identity(1)
 
+        # wait for the backend to start
+        if self.use_backend:
+            while True:
+                try:
+                    msg = self.backend2main.get_nowait()
+                    if "Init" in msg:
+                        logger.info("Backend initialized")
+                        break
+                except Exception as e:
+                    print("Waiting for backend to start...")
+                    time.sleep(0.2)
+     
     def reset(self):
         """Reset the VIO system"""
         logger.info("Resetting VIO system")

@@ -54,7 +54,8 @@ pip install --no-build-isolation -e .
  
 pip install open3d loguru pypose
 # install flash attention
-pip install flashattention --no-build-isolation
+pip install flash-attn --no-build-isolation
+
 
 # Optionally install torchcodec for faster mp4 loading
 pip install torchcodec==0.1

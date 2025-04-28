@@ -251,10 +251,10 @@ class FactorGraph:
 
         pose_data = T_WCs.data[:, 0, :]
 
-        sigma_odom_t = 0.002
-        sigma_odom_r = 0.005
+        sigma_odom_t = 0.0002
+        sigma_odom_r = 0.0005
         sigma_ray = 0.1
-        sigma_scale_prior = 1
+        sigma_scale_prior = 0.1
         s_bar = torch.tensor(s_bar)
 
         dx = mast3r_slam_backends.gauss_newton_rays_odom(
