@@ -75,7 +75,7 @@ def relocalization(frame, keyframes, factor_graph, retrieval_database, config):
 def run_backend(config, device, states, keyframes, main2backend, backend2main, K=None):
     set_global_config(config)
 
-    torch.cuda.set_device(1)
+    torch.cuda.set_device(device)
     model = load_mast3r(device=device)
     factor_graph = FactorGraph(model, keyframes, config,K, device)
     retrieval_database = load_retriever(model, device=device)
@@ -161,7 +161,16 @@ def run_backend(config, device, states, keyframes, main2backend, backend2main, K
                 idx = states.global_optimizer_tasks.pop(0)
                 
 class VIO:
-    def __init__(self, config, img_size, calib=None, device="cuda:0", use_backend=True, visualize=False):
+    def __init__(
+        self, 
+        config, 
+        img_size, 
+        calib=None, 
+        tracking_device = "cuda", 
+        use_backend=True, 
+        backend_device= "cuda",
+        visualize=False, 
+        ):
         """
         Initialize the Visual-Inertial Odometry system.
         
@@ -172,7 +181,7 @@ class VIO:
             device: Device to run the model on
         """
         self.config = config
-        self.device = device
+        self.device = torch.device(tracking_device)
         self.img_size = img_size
         self.h, self.w = img_size
         self.visualize = visualize
@@ -183,6 +192,7 @@ class VIO:
         # Set up multiprocessing
         mp.set_start_method('spawn', force=True)
         torch.backends.cuda.matmul.allow_tf32 = True
+        torch.cuda.set_device(self.device)
         
         # self.altas = [self.keyframes]
         # Load model
@@ -209,7 +219,7 @@ class VIO:
             self.viz.start()
         
         if use_backend:
-            device_backend = torch.device("cuda:1")
+            device_backend = torch.device(backend_device)
             self.main2backend = new_queue(manager, not visualize)
             self.backend2main = new_queue(manager, not visualize)
             self.backend = mp.Process(target=run_backend, args=(config, device_backend, self.states, self.keyframes, self.main2backend, self.backend2main))

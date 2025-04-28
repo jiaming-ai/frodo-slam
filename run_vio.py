@@ -109,13 +109,19 @@ def run_robot(args):
         K = camera_intrinsics.K_frame
     
 
+    if args.use_multiple_gpu and torch.cuda.device_count() > 1:
+        backend_device = 1
+    else:
+        backend_device = 0
+
     # Initialize VIO
     vio = VIO(
         config=config,
         img_size=(h, w),
         calib=K,
-        device=args.device,
+        tracking_device_id=args.device,
         visualize=args.visualize,
+        backend_device=backend_device
     )
     
     stop_event = threading.Event()
@@ -200,7 +206,7 @@ def run_dataset(args):
         config=config,
         img_size=(h, w),
         calib=K,
-        device=args.device,
+        tracking_device_id=args.device,
         visualize=args.visualize
     )
     
@@ -253,6 +259,8 @@ if __name__ == "__main__":
                         help="Resize image to this size (long edge)")
     parser.add_argument("--debug", action="store_true",
                         help="Debug mode")
+    parser.add_argument("--use_multiple_gpu", action="store_true",
+                        help="Use multiple GPUs")
 
     args = parser.parse_args()
 
